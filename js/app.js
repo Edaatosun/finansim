@@ -123,7 +123,9 @@
   }
   const isCommit = (c) => c.kind === 'fixed' || c.kind === 'taksit';
   const catLabel = (c) => (c.kind === 'taksit' && c.count ? `${c.name} (${c.seq}/${c.count})` : c.name);
-  const instActive = (i, k) => k >= i.start && monthDiff(i.start, k) < i.count;
+  // Taksit, eklendiği aydan (from) itibaren görünür; daha önceki aylara hiç yazılmaz.
+  const instFrom = (i) => (i.from && i.from > i.start ? i.from : i.start);
+  const instActive = (i, k) => k >= instFrom(i) && monthDiff(i.start, k) < i.count;
 
   function migrate(s) {
     s.ui = s.ui || {}; s.ui.month = s.ui.month || monthKeyOf(); s.ui.mode = s.ui.mode || 'gider';
@@ -1354,8 +1356,8 @@
     const stOf = (pred) => (m ? m.categories.find(pred) : null);
     const paidOf = (c) => (c ? sum(m.expenses.filter((e) => e.catId === c.id), 'amount') : 0);
     const active = state.installments.filter((i) => instActive(i, key));
-    const upcoming = state.installments.filter((i) => i.start > key);
-    const done = state.installments.filter((i) => !instActive(i, key) && i.start <= key);
+    const upcoming = state.installments.filter((i) => instFrom(i) > key);
+    const done = state.installments.filter((i) => !instActive(i, key) && instFrom(i) <= key);
     const fixedTotal = sum(state.plan.fixed, 'amount'), instTotal = sum(active, 'monthly');
     const next = Array.from({ length: 6 }, (_, n) => addMonth(monthKeyOf(), n)).map((k) => ({ k, f: fixedTotal, t: sum(state.installments.filter((i) => instActive(i, k)), 'monthly') }));
     const maxN = Math.max(1, ...next.map((x) => x.f + x.t));
@@ -1450,11 +1452,27 @@
     });
   }
 
+  // Yalnızca bu taksiti verilen aydan itibaren mevcut aylara uygular; diğer plan kalemlerine dokunmaz.
+  // Ödenmiş (harcaması olan) taksit satırları hiçbir zaman silinmez.
+  function syncInstallment(id, fromKey) {
+    const inst = state.installments.find((i) => i.id === id);
+    monthKeys().filter((k) => k >= fromKey).forEach((k) => {
+      const m = state.months[k];
+      const c = m.categories.find((x) => x.instId === id);
+      const paid = c && m.expenses.some((e) => e.catId === c.id);
+      if (inst && instActive(inst, k)) {
+        const f = { kind: 'taksit', name: inst.name, emoji: inst.emoji || '🧾', planned: inst.monthly, seq: monthDiff(inst.start, k) + 1, count: inst.count, subs: [] };
+        if (!c) m.categories.push({ id: uid(), instId: id, ...f }); else Object.assign(c, f);
+      } else if (c && !paid) m.categories = m.categories.filter((x) => x !== c);
+    });
+  }
+
   function installmentForm(inst) {
     const isNew = !inst;
-    const now = monthKeyOf();
-    const x = inst || { name: '', emoji: '🧾', monthly: '', count: 3, start: now };
-    const curSeq = inst ? clamp(monthDiff(inst.start, now) + 1, 1, inst.count) : 1;
+    const view0 = curMonthKey(); // ekranda bakılan ay (ör. Aralık)
+    const x = inst || { name: '', emoji: '🧾', monthly: '', count: 3, start: view0 };
+    const from0 = inst ? inst.from || (view0 > inst.start ? view0 : inst.start) : view0;
+    const curSeq = inst ? clamp(monthDiff(inst.start, from0) + 1, 1, inst.count) : 1;
     openSheet(isNew ? 'Taksit ekle' : 'Taksiti düzenle', `
       <form id="f">
         <div class="row2" style="grid-template-columns:80px 1fr">
@@ -1463,9 +1481,11 @@
         </div>
         <div class="seg" id="tmode"><button type="button" data-t="monthly" class="on">Aylık tutar</button><button type="button" data-t="total">Toplam tutar</button></div>
         <div class="field"><label id="amt-l">Aylık taksit tutarı</label><input class="input big" name="amount" inputmode="decimal" value="${amtStr(x.monthly)}" placeholder="₺0" required></div>
+        <div class="field"><label>Hangi aydan itibaren eklensin?</label><input class="input" type="month" name="from" value="${from0}" required>
+          <div class="hint">Bu aydan önceki aylara eklenmez.</div></div>
         <div class="row2">
           <div class="field"><label>Toplam taksit sayısı</label><input class="input" name="count" inputmode="numeric" value="${x.count}" required></div>
-          <div class="field"><label>Bu ay kaçıncı taksit?</label><input class="input" name="seq" inputmode="numeric" value="${curSeq}"></div>
+          <div class="field"><label id="seq-l">O ay kaçıncı taksit?</label><input class="input" name="seq" inputmode="numeric" value="${curSeq}"></div>
         </div>
         <div class="hint" id="calc" style="margin:-4px 0 12px"></div>
         <button class="btn" type="submit">Kaydet</button>
@@ -1478,33 +1498,38 @@
         const seq = clamp(parseInt(f.seq.value, 10) || 1, 1, n);
         const a = parseAmount(f.amount.value) || 0;
         const monthly = mode === 'monthly' ? a : Math.round((a / n) * 100) / 100;
-        return { n, seq, monthly, start: addMonth(now, -(seq - 1)) };
+        const from = /^\d{4}-\d{2}$/.test(f.from.value) ? f.from.value : view0;
+        return { n, seq, monthly, from, start: addMonth(from, -(seq - 1)) };
       };
       const upd = () => {
         const v = vals();
-        $('#calc', root).innerHTML = v.monthly > 0 ? `Ayda <b>${money2(v.monthly)}</b> · toplam ${money(v.monthly * v.n)} · ${monthName(v.start, true)} → ${monthName(addMonth(v.start, v.n - 1), true)} · kalan ${v.n - v.seq + 1} taksit (${money(v.monthly * (v.n - v.seq + 1))})` : '';
+        $('#seq-l', root).textContent = `${monthName(v.from)} kaçıncı taksit?`;
+        const last = addMonth(v.start, v.n - 1), leftN = v.n - v.seq + 1;
+        $('#calc', root).innerHTML = v.monthly > 0 ? `Ayda <b>${money2(v.monthly)}</b> · <b>${monthName(v.from, true)} → ${monthName(last, true)}</b> arası ${leftN} ay eklenecek (${money(v.monthly * leftN)}). ${monthName(addMonth(v.from, -1))} ve öncesine dokunulmaz.` : '';
       };
       $$('#tmode button', root).forEach((b) => (b.onclick = () => {
         mode = b.dataset.t; $$('#tmode button', root).forEach((y) => y.classList.toggle('on', y === b));
         $('#amt-l', root).textContent = mode === 'monthly' ? 'Aylık taksit tutarı' : 'Toplam tutar'; upd();
       }));
-      f.amount.oninput = upd; f.count.oninput = upd; f.seq.oninput = upd; upd();
+      f.amount.oninput = upd; f.count.oninput = upd; f.seq.oninput = upd; f.from.onchange = upd; upd();
       f.onsubmit = (ev) => {
         ev.preventDefault();
         const v = vals();
         if (!(v.monthly > 0)) return toast('Geçerli bir tutar gir');
-        const data = { name: f.name.value.trim(), emoji: f.emoji.value.trim() || '🧾', monthly: v.monthly, count: v.n, start: v.start };
+        const data = { name: f.name.value.trim(), emoji: f.emoji.value.trim() || '🧾', monthly: v.monthly, count: v.n, start: v.start, from: v.from };
+        // Düzenlemede eski başlangıç ayı daha erkense, oradaki ödenmemiş satırlar da temizlenir
+        const syncFrom = inst && instFrom(inst) < v.from ? instFrom(inst) : v.from;
         let id;
         if (isNew) { id = uid(); state.installments.push({ id, ...data }); } else { Object.assign(inst, data); id = inst.id; }
-        if (!state.months[now] && state.plan) buildMonth(now);
-        syncFuture(new Set([id]));
-        save(); closeSheet(); toast(`${data.name}: ${data.count} × ${money(data.monthly)}`); renderView();
+        if (!state.months[v.from] && state.plan) buildMonth(v.from);
+        syncInstallment(id, syncFrom);
+        save(); closeSheet(); toast(`${data.name}: ${monthName(v.from, true)} itibarıyla ${v.n - v.seq + 1} × ${money(data.monthly)}`); renderView();
       };
       const del = $('#del', root);
       if (del) del.onclick = () => {
-        if (!confirm(`${inst.name} taksiti silinsin mi? (Ödenmiş taksitler geçmişte kalır)`)) return;
+        if (!confirm(`${inst.name} taksiti silinsin mi? (Ödenmiş aylar korunur)`)) return;
         state.installments = state.installments.filter((y) => y.id !== inst.id);
-        syncFuture(new Set());
+        syncInstallment(inst.id, '0000-00');
         save(); closeSheet(); toast('Silindi'); renderView();
       };
     });
@@ -1559,7 +1584,7 @@
           <label class="check slim"><input type="checkbox" data-f="cat-sav" data-id="${c.id}" ${c.toSavings ? 'checked' : ''}> Artarsa birikime aktar</label>
         </div>`).join('')}`;
     } else if (w.step === 2) {
-      const curInst = w.inst.filter((i) => instActive(i, now) || i.start > now);
+      const curInst = w.inst.filter((i) => instActive(i, now) || instFrom(i) > now);
       body = `<p class="muted small" style="margin-top:0">Her ay düzenli ödediklerin: kira, kredi kartı, fatura, abonelik, kurs…</p>
         <div class="chips">${SUGGEST_FIXED.filter(([n]) => !p.fixed.some((f) => lower(f.name) === lower(n))).map(([n, e]) => `<button type="button" data-addfix="${n}" data-e="${e}">${e} ${n}</button>`).join('')}</div>
         ${p.fixed.map((x) => `<div class="wrow emoji"><input class="input" data-f="fix-emoji" data-id="${x.id}" value="${esc(x.emoji || '')}" style="text-align:center">
