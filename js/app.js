@@ -114,9 +114,12 @@
     try { localStorage.setItem(STORE_KEY, JSON.stringify(state)); }
     catch { toast('Kaydedilemedi: tarayıcı depolaması kapalı olabilir'); }
   }
-  function freshState(name) {
+  // Kullanıcı adı: küçük harf, Türkçe karakterler sadeleştirilir; sonuna 4 haneli etiket eklenir (@eda#4821)
+  const slugHandle = (s) => String(s || '').toLocaleLowerCase('tr').replace(/[çğıöşü]/g, (c) => ({ ç: 'c', ğ: 'g', ı: 'i', ö: 'o', ş: 's', ü: 'u' }[c])).replace(/[^a-z0-9._]/g, '').slice(0, 20);
+  const newTag = () => String(Math.floor(1000 + Math.random() * 9000));
+  function freshState(name, handle) {
     return {
-      version: 3, user: { name }, settings: { theme: 'auto', pinHash: null },
+      version: 4, user: { name, handle: handle || slugHandle(name) || 'kullanici', tag: newTag(), id: uid() + uid() }, settings: { theme: 'auto', pinHash: null },
       plan: null, installments: [], months: {}, savings: { holdings: [], goals: [] },
       rates: null, rateOverrides: {}, ui: { month: monthKeyOf(), mode: 'gider', cat: null },
     };
@@ -172,6 +175,10 @@
       delete m.saving.planned;
     }
     s.savings.goals.forEach((g) => { g.kind = g.kind || 'other'; g.mode = g.mode || 'all'; });
+    s.user = s.user || { name: 'Ben' };
+    if (!s.user.handle) s.user.handle = slugHandle(s.user.name) || 'kullanici';
+    if (!s.user.tag) s.user.tag = newTag();
+    if (!s.user.id) s.user.id = uid() + uid();
     s.version = 4;
     return s;
   }
@@ -184,7 +191,7 @@
   // only: değişen öğe id'leri (Set) — null ise her şey plandaki değerlere eşitlenir.
   function syncMonth(k, only) {
     const m = state.months[k], p = state.plan;
-    if (!m || !p) return;
+    if (!m || !p || m.detached) return; // 'boş başlatılan' aylar plandan etkilenmez
     m.skip = m.skip || [];
     const want = (id) => !only || only.has(id);
     const hasEx = (c) => m.expenses.some((e) => e.catId === c.id);
@@ -282,7 +289,7 @@
       state.plan = {
         incomes: p.i.map(([name, amount]) => ({ id: uid(), name, amount })),
         fixed: p.f.map(([name, amount, emoji]) => ({ id: uid(), name, amount, emoji })),
-        categories: p.c.map(([name, emoji, planned, subs, toSav]) => ({ id: uid(), name, emoji, planned, subs: (subs || []).map((n) => ({ id: uid(), name: n })), toSavings: !!toSav })),
+        categories: p.c.map(([name, emoji, planned, subs, toSav]) => ({ id: uid(), name, emoji, planned, subs: (subs || []).map((n) => (Array.isArray(n) ? { id: uid(), name: n[0], planned: n[1] || 0 } : { id: uid(), name: n, planned: 0 })), toSavings: !!toSav })),
         savingItems: [], reviewed: false,
       };
       addHoldingsGoals(d);
@@ -314,6 +321,35 @@
     if (!state.plan) { state = migrate(state); }
     state.ui.month = d.m;
   }
+  // ---------- Taşıma linki: tüm veriler sıkıştırılıp linkin # kısmına konur (sunucuya gitmez) ----------
+  const b64url = (bytes) => { let s = ''; for (let i = 0; i < bytes.length; i += 0x8000) s += String.fromCharCode.apply(null, bytes.subarray(i, i + 0x8000)); return btoa(s).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, ''); };
+  const unb64url = (str) => { const b = str.replace(/-/g, '+').replace(/_/g, '/'); const bin = atob(b + '==='.slice((b.length + 3) % 4)); return Uint8Array.from(bin, (c) => c.charCodeAt(0)); };
+  async function pipeBytes(bytes, stream) { return new Uint8Array(await new Response(new Blob([bytes]).stream().pipeThrough(stream)).arrayBuffer()); }
+  async function encodeTransfer() {
+    const data = { ...state, rates: null, ui: { month: monthKeyOf(), mode: 'gider', cat: null } };
+    const raw = new TextEncoder().encode(JSON.stringify(data));
+    let payload;
+    if (window.CompressionStream) payload = 'z' + b64url(await pipeBytes(raw, new CompressionStream('deflate-raw')));
+    else payload = 'j' + b64url(raw);
+    return `${location.origin}${location.pathname}#tasi=${payload}`;
+  }
+  async function decodeTransfer(text) {
+    try {
+      const mt = String(text).trim().match(/(?:#tasi=)?([zj])([A-Za-z0-9_-]+)\s*$/);
+      if (!mt) return null;
+      let bytes = unb64url(mt[2]);
+      if (mt[1] === 'z') bytes = await pipeBytes(bytes, new DecompressionStream('deflate-raw'));
+      const d = JSON.parse(new TextDecoder().decode(bytes));
+      if (!d || !d.months || !d.user) return null;
+      return migrate(d);
+    } catch { return null; }
+  }
+  let pendingTransfer = null;
+  if (location.hash.startsWith('#tasi=')) {
+    pendingTransfer = location.hash;
+    history.replaceState(null, '', location.pathname + '#/ozet');
+  }
+
   let pendingCode = null;
   if (location.hash.startsWith('#veri=')) {
     pendingCode = decodeCode(location.hash);
@@ -334,7 +370,7 @@
     else if (diff < 0) status = 'over';
     else if (spent === 0) status = isCommit(c) ? 'pending' : 'untouched';
     else status = 'ok';
-    const bySub = (c.subs || []).map((s) => ({ ...s, spent: sum(ex.filter((e) => e.subId === s.id), 'amount') }));
+    const bySub = (c.subs || []).map((s) => ({ ...s, planned: +s.planned || 0, spent: sum(ex.filter((e) => e.subId === s.id), 'amount') }));
     const noSub = sum(ex.filter((e) => !e.subId || !(c.subs || []).some((s) => s.id === e.subId)), 'amount');
     return {
       ...c, planned, spent, diff, count: ex.length, status, bySub, noSub,
@@ -721,27 +757,57 @@
     const cls = c.status === 'over' || c.status === 'unplanned' ? 'over' : c.status === 'ok' && c.diff === 0 ? 'good' : '';
     return `<div class="bar"><i class="${cls}" style="width:${p}%"></i></div>`;
   }
+  // Alt başlık satırı: "Ayakkabı ₺800/₺1.000 · Giyim ₺1.200/₺4.000"
   const subLine = (c) => {
-    const parts = c.bySub.filter((s) => s.spent > 0).map((s) => `${esc(s.name)} ${money(s.spent)}`);
-    if (c.noSub > 0 && c.bySub.length) parts.push(`Diğer ${money(c.noSub)}`);
-    return parts.length ? `<div class="subline">${parts.join(' · ')}</div>` : c.subs && c.subs.length ? `<div class="subline">${c.subs.map((s) => `<span class="pill-sub">${esc(s.name)}</span>`).join('')}</div>` : '';
+    if (!c.bySub || !c.bySub.length) return '';
+    const parts = c.bySub.map((s) => {
+      const over = s.planned > 0 && s.spent > s.planned;
+      return `<span class="${over ? 'bad' : ''}">${esc(s.name)} ${money(s.spent)}${s.planned > 0 ? '/' + money(s.planned) : ''}${over ? ' ▲' : ''}</span>`;
+    });
+    if (c.noSub > 0) parts.push(`Diğer ${money(c.noSub)}`);
+    return `<div class="subline">${parts.join(' · ')}</div>`;
   };
+  // Plan seçimi: kendi planı / önerilen plan / boş plan
+  const planChoiceHTML = () => `
+    <button class="choice" data-pc="own"><span class="ic">✍️</span><span><b>Kendi planımı oluşturayım</b><br><span class="muted small">Gelir → sabit giderler → birikim → kalanı kategorilere dağıt</span></span></button>
+    <button class="choice" data-pc="suggested"><span class="ic">✨</span><span><b>Önerilen planla başla</b><br><span class="muted small">Gelirini ve sabit giderlerini gir; birikim ve kategori bütçelerini biz önerelim</span></span></button>
+    <button class="choice" data-pc="empty"><span class="ic">📄</span><span><b>Boş plan</b><br><span class="muted small">Hiçbir şey hazır gelmesin; her şeyi kendim eklerim</span></span></button>`;
+  function bindPlanChoice(root, after) {
+    $$('[data-pc]', root).forEach((b) => (b.onclick = () => {
+      const c = b.dataset.pc;
+      if (after) after();
+      if (c === 'own') openWizard('new');
+      else if (c === 'suggested') openWizard('suggested');
+      else setEmptyPlan();
+    }));
+  }
+  function setEmptyPlan() {
+    state.plan = { incomes: [], fixed: [], categories: [], savingItems: [], reviewed: true, empty: true };
+    const now = monthKeyOf();
+    if (!state.months[now]) buildMonth(now);
+    state.ui.month = now;
+    save(); toast('Boş planla başladın — Ayarlar → Planım’dan istediğin zaman plan oluşturabilirsin'); location.hash = '#/ozet'; renderView();
+  }
   function emptyMonth(key) {
-    if (!state.plan) return `<div class="card empty"><div class="big">🧭</div><h3>Önce planını oluşturalım</h3>
-      <p class="small">Gelirini, düzenli ödemelerini, birikimini ve harcama kategorilerini birkaç adımda belirle. Plan her ay otomatik kullanılır.</p>
-      <button class="btn" data-act="wizard">Planımı oluştur</button></div>`;
+    if (!state.plan) return `<div class="card"><div style="text-align:center;font-size:40px">🧭</div><h3 style="text-align:center">Planını seç</h3>
+      <p class="small muted" style="text-align:center">Plan bir kez kurulur, her ay otomatik kullanılır.</p>${planChoiceHTML()}</div>`;
     return `<div class="card empty"><div class="big">🗓️</div><h3>${monthName(key)} henüz açılmadı</h3>
       <p class="small">Planın bu aya uygulanır; sonra istediğini bu ay için değiştirebilirsin.</p>
-      <button class="btn" data-act="build">Planımı ${monthName(key)} ayına uygula</button></div>`;
+      <button class="btn" data-act="build">Planımı ${monthName(key)} ayına uygula</button>
+      <div style="height:8px"></div><button class="btn secondary" data-act="blank">Bu ay boş başlasın</button>
+      <p class="hint">Boş ay: planın bu aya uygulanmaz; gelir ve kategorileri bu ay için kendin eklersin. Sonraki aylar planınla devam eder.</p></div>`;
   }
   function bindEmptyMonth(key) {
-    const w = $('[data-act="wizard"]', view); if (w) w.onclick = () => openWizard(state.plan ? 'edit' : 'first');
+    bindPlanChoice(view);
     const b = $('[data-act="build"]', view); if (b) b.onclick = () => { buildMonth(key); save(); toast('Plan uygulandı'); renderView(); };
+    const e = $('[data-act="blank"]', view); if (e) e.onclick = () => { state.months[key] = { incomes: [], categories: [], expenses: [], saving: { done: 0, items: [] }, skip: [], detached: true }; save(); toast(`${monthName(key)} boş başladı`); renderView(); };
   }
-  function warnAfterSave(month, catId) {
+  function warnAfterSave(month, catId, subId) {
     const c = month.categories.find((x) => x.id === catId);
     if (!c) return 'Kaydedildi';
     const st = catStats(month, c);
+    const sb = subId && st.bySub.find((s) => s.id === subId);
+    if (sb && sb.planned > 0 && sb.spent > sb.planned) return `⚠︎ ${sb.name}: alt bütçe ${money(sb.spent - sb.planned)} aşıldı · ${c.name}: ${st.diff >= 0 ? money(st.diff) + ' kaldı' : money(-st.diff) + ' aşım'}`;
     if (!(st.planned > 0)) return `${c.name}: bütçesi yok, ekstra sayıldı`;
     if (st.diff < 0) return `⚠︎ ${c.name}: ${money(-st.diff)} aşıldı`;
     if (st.spent / st.planned >= 0.8) return `⚠︎ ${c.name}: bütçenin %${Math.round((st.spent / st.planned) * 100)}'i doldu · ${money(st.diff)} kaldı`;
@@ -876,7 +942,7 @@
     $('#btn-save').onclick = () => transferForm(m, key, '');
     $$('[data-buy]', view).forEach((b) => (b.onclick = () => buyItemForm(m, key, m.saving.items.find((i) => i.id === b.dataset.buy))));
     $$('[data-undo]', view).forEach((b) => (b.onclick = () => undoItem(m, m.saving.items.find((i) => i.id === b.dataset.undo))));
-    const asi = $('#add-si'); if (asi) asi.onclick = () => openWizard(state.plan ? 'edit' : 'first', 3);
+    const asi = $('#add-si'); if (asi) asi.onclick = () => openWizard(state.plan ? 'edit' : 'first', 2);
     const br = $('#btn-rest'); if (br) br.onclick = () => transferForm(m, key, Math.round(s.cash));
   }
 
@@ -1007,7 +1073,7 @@
         <div class="cat-bottom"><span>${statusChip(st, s.phase)}</span><span class="muted">${st.planned > 0 ? '%' + Math.round((st.spent / st.planned) * 100) + ' kullanıldı' : ''}</span></div>
         ${st.bySub.length ? `<div class="filters" style="margin-top:12px;margin-bottom:0">
           <button data-sub="" class="${!subFilter ? 'on' : ''}">Tümü</button>
-          ${st.bySub.map((x) => `<button data-sub="${x.id}" class="${subFilter === x.id ? 'on' : ''}">${esc(x.name)} · ${money(x.spent)}</button>`).join('')}
+          ${st.bySub.map((x) => `<button data-sub="${x.id}" class="${subFilter === x.id ? 'on' : ''}" ${x.planned > 0 && x.spent > x.planned ? 'style="color:var(--bad)"' : ''}>${esc(x.name)} · ${money(x.spent)}${x.planned > 0 ? ' / ' + money(x.planned) : ''}</button>`).join('')}
         </div>` : ''}
       </div>` : ''}
 
@@ -1137,7 +1203,7 @@
 
   function addExpense(m, key, data) {
     const targetKey = data.date.slice(0, 7);
-    if (targetKey === key) { m.expenses.push({ id: uid(), ...data }); return warnAfterSave(m, data.catId); }
+    if (targetKey === key) { m.expenses.push({ id: uid(), ...data }); return warnAfterSave(m, data.catId, data.subId); }
     const src = m.categories.find((c) => c.id === data.catId);
     const tm = ensureMonth(targetKey);
     let tc = tm.categories.find((c) => lower(c.name) === lower(src.name));
@@ -1145,7 +1211,7 @@
     const sname = data.subId && (src.subs || []).find((s) => s.id === data.subId)?.name;
     const ts = sname && (tc.subs || []).find((s) => lower(s.name) === lower(sname));
     tm.expenses.push({ id: uid(), ...data, catId: tc.id, subId: ts ? ts.id : undefined });
-    return `${monthName(targetKey)} ayına kaydedildi · ${warnAfterSave(tm, tc.id)}`;
+    return `${monthName(targetKey)} ayına kaydedildi · ${warnAfterSave(tm, tc.id, ts ? ts.id : null)}`;
   }
 
   function exportCSV(m, key) {
@@ -1293,11 +1359,13 @@
           <div class="field"><label>Simge</label><input class="input" name="emoji" value="${esc(c.emoji || '')}" maxlength="4" placeholder="🛍️" style="text-align:center"></div>
           <div class="field"><label>Ad</label><input class="input" name="name" value="${esc(c.name)}" placeholder="ör. İhtiyaçlarım" required></div>
         </div>
-        <div class="field"><label>Ayrılan tutar</label><input class="input" name="planned" inputmode="decimal" value="${amtStr(c.planned)}" placeholder="₺0"></div>
-        <div class="field"><label>Alt başlıklar</label>
-          <div class="subs" style="margin-top:0">${c.subs.map((s) => `<span class="chip neutral">${esc(s.name)} <button type="button" class="x-s" data-dsub="${s.id}">✕</button></span>`).join('')}
-            <input class="input sub-in" id="new-sub" placeholder="+ alt başlık ekle"></div>
-          <div class="hint">ör. Kıyafet, Kozmetik, Ev ihtiyaçları. Harcamayı girerken seçersin.</div></div>
+        <div class="field"><label>Ayrılan tutar ${c.subs.length ? '(üst limit)' : ''}</label><input class="input" name="planned" inputmode="decimal" value="${amtStr(c.planned)}" placeholder="₺0"></div>
+        <div class="field"><label>Alt başlıklar ve bütçeleri</label>
+          ${c.subs.map((s) => `<div class="subrow"><span class="tree">└</span><input class="input" data-sname="${s.id}" value="${esc(s.name)}">
+            <input class="input amt-in" data-splan="${s.id}" inputmode="decimal" value="${amtStr(s.planned)}" placeholder="₺0"><button type="button" class="x" data-dsub="${s.id}">✕</button></div>`).join('')}
+          <div class="subrow"><span class="tree">└</span><input class="input sub-in2" id="new-sub" placeholder="+ alt başlık ekle (ör. Ayakkabı)"></div>
+          <div class="subsum" id="ss">${subSumText({ ...c, planned: parseAmount(c.planned) || 0 })}</div>
+          <div class="hint">Alt başlık bütçeleri kategori limitinin içinden ayrılır; toplamları limiti aşamaz.</div></div>
         <label class="check"><input type="checkbox" name="toSavings" ${c.toSavings ? 'checked' : ''}> Ay sonunda artarsa birikime aktarılacak</label>
         <label class="check"><input type="checkbox" name="plan" ${isNew || cat.tplId ? 'checked' : ''}> Planıma kaydet (sonraki aylarda da böyle olsun)</label>
         <button class="btn" type="submit">Kaydet</button>
@@ -1309,8 +1377,16 @@
       </form>`, (root) => {
       const f = $('#f', root);
       const keep = () => { c.name = f.name.value; c.emoji = f.emoji.value; c.planned = f.planned.value; c.toSavings = f.toSavings.checked; };
+      const refreshSum = () => { $('#ss', root).innerHTML = subSumText({ ...c, planned: parseAmount(f.planned.value) || 0 }); };
+      $$('[data-sname]', root).forEach((el) => (el.oninput = () => { c.subs.find((s) => s.id === el.dataset.sname).name = el.value; }));
+      $$('[data-splan]', root).forEach((el) => (el.oninput = () => { c.subs.find((s) => s.id === el.dataset.splan).planned = amt0(el.value); refreshSum(); }));
+      f.planned.oninput = refreshSum;
       $('#new-sub', root).addEventListener('keydown', (ev) => { if (ev.key === 'Enter') { ev.preventDefault(); ev.target.blur(); } });
-      $('#new-sub', root).onchange = (ev) => { const n = ev.target.value.trim(); if (!n) return; keep(); c.subs.push({ id: uid(), name: n }); draw(); setTimeout(() => $('#new-sub').focus(), 50); };
+      $('#new-sub', root).onchange = (ev) => {
+        const n = ev.target.value.trim(); if (!n) return; keep();
+        const free = Math.max(0, (parseAmount(c.planned) || 0) - sum(c.subs, 'planned'));
+        c.subs.push({ id: uid(), name: n, planned: free }); draw(); setTimeout(() => $('#new-sub').focus(), 50);
+      };
       $$('[data-dsub]', root).forEach((b) => (b.onclick = () => {
         const inUse = m.expenses.some((e) => e.subId === b.dataset.dsub);
         if (inUse && !confirm('Bu alt başlıkta harcama var; harcamalar alt başlıksız kalır. Silinsin mi?')) return;
@@ -1320,7 +1396,8 @@
         ev.preventDefault();
         const planned = f.planned.value.trim() ? parseAmount(f.planned.value) : 0;
         if (!(planned >= 0)) return toast('Geçerli bir tutar gir');
-        const data = { name: f.name.value.trim(), planned, emoji: f.emoji.value.trim(), subs: clone(c.subs), toSavings: f.toSavings.checked };
+        if (c.subs.length && sum(c.subs, 'planned') > planned) return toast('Alt bütçelerin toplamı kategori limitini aşamaz');
+        const data = { name: f.name.value.trim(), planned, emoji: f.emoji.value.trim(), subs: clone(c.subs.filter((s) => s.name.trim())), toSavings: f.toSavings.checked };
         let target = cat;
         if (isNew) { target = { id: uid(), kind: 'var', ...data }; m.categories.push(target); } else Object.assign(cat, data);
         m.expenses.forEach((e) => { if (e.catId === target.id && e.subId && !data.subs.some((s) => s.id === e.subId)) delete e.subId; });
@@ -1536,15 +1613,45 @@
   }
 
   // ---------- Plan sihirbazı ----------
-  const WSTEPS = ['Gelirlerin', 'Harcama kategorilerin', 'Düzenli ödemelerin', 'Birikim planın', 'Kalanı dağıt', 'Özet'];
+  // Sıra: gelir → sabit ödemeler (fatura, kredi kartı, kira, taksit) → birikim → kalanla ne yapacağın (kategori + alt bütçe) → özet
+  const WSTEPS = ['Gelirlerin', 'Sabit ödemelerin', 'Birikim planın', 'Harcama bütçen', 'Özet'];
+  const SUB_WEIGHTS = { 'Kıyafet': 35, 'Kozmetik': 20, 'Ev ihtiyaçları': 25, 'İstediğim bir şey': 20, 'BİM / A101 / Şok': 70, 'Gross / toptan': 30 };
+  const newCat = (s) => ({ id: uid(), name: s.name, emoji: s.emoji, planned: 0, subs: (s.subs || []).map((n) => ({ id: uid(), name: n, planned: 0 })), toSavings: !!s.toSavings });
+  // Kategori bütçesini alt başlıklara önerilen oranlarla böler (toplam = kategori limiti)
+  function splitSubs(c) {
+    if (!c.subs || !c.subs.length) return;
+    const ws = c.subs.map((s) => SUB_WEIGHTS[s.name] || 1);
+    const tot = sum(ws, (x) => x);
+    let acc = 0;
+    c.subs.forEach((s, i) => { s.planned = i === c.subs.length - 1 ? Math.max(0, c.planned - acc) : round50((c.planned * ws[i]) / tot); acc += s.planned; });
+  }
+  function subSumText(c) {
+    if (!c.subs || !c.subs.length) return '';
+    const s = sum(c.subs, 'planned'), d = (+c.planned || 0) - s;
+    if (d < 0) return `<span class="bad">⚠︎ Alt bütçeler ${money(s)} — ${esc(c.name)} limitini ${money(-d)} aşıyor</span>`;
+    return `Alt bütçeler ${money(s)} / ${money(c.planned)}${d > 0 ? ` · <span class="good">${money(d)} serbest</span>` : ' · tam dağıtıldı'}`;
+  }
+  function applySuggestion(w, withSaving) {
+    const p = w.plan;
+    if (withSaving) {
+      const t = wTotals(w);
+      const sug = suggestPlan(t.income, t.fixed + t.taksit, p.categories).saving;
+      p.savingItems = sug > 0 ? [{ id: uid(), type: 'TRY', amount: sug, qty: 0, goalId: null }] : [];
+    }
+    const t2 = wTotals(w);
+    const wsum = sum(p.categories, (c) => weightOf(c.name)) || 1;
+    p.categories.forEach((c) => { c.planned = round50((Math.max(0, t2.kalan) * 0.95 * weightOf(c.name)) / wsum); splitSubs(c); });
+  }
   function openWizard(mode, step) {
-    const base = mode === 'edit' && state.plan ? clone(state.plan) : {
-      incomes: [{ id: uid(), name: 'Maaş', amount: 0 }], fixed: [], savingItems: [],
-      categories: SUGGEST_CATS.filter((s) => s.def).map((s) => ({ id: uid(), name: s.name, emoji: s.emoji, planned: 0, subs: (s.subs || []).map((n) => ({ id: uid(), name: n })), toSavings: !!s.toSavings })),
+    const useOld = mode === 'edit' && state.plan && !state.plan.empty;
+    const base = useOld ? clone(state.plan) : {
+      incomes: state.plan && state.plan.incomes.length ? clone(state.plan.incomes) : [{ id: uid(), name: 'Maaş', amount: 0 }],
+      fixed: [], savingItems: [], categories: SUGGEST_CATS.filter((s) => s.def).map(newCat),
     };
     if (!base.incomes.length) base.incomes.push({ id: uid(), name: 'Maaş', amount: 0 });
     base.savingItems = base.savingItems || [];
-    const w = { step: step || 0, mode, plan: base, inst: clone(state.installments || []), newInst: [], apply: true };
+    base.categories.forEach((c) => { c.subs = (c.subs || []).map((s) => ({ ...s, planned: +s.planned || 0 })); });
+    const w = { step: step || 0, mode, plan: base, inst: clone(state.installments || []), newInst: [], apply: true, suggested: false };
     drawWizard(w);
   }
   function wTotals(w) {
@@ -1562,30 +1669,18 @@
     const t = wTotals(w);
     const p = w.plan;
     const now = monthKeyOf();
+    const sugNote = w.mode === 'suggested' && w.suggested ? '<div class="banner" style="margin-bottom:12px"><div class="t">✨ <b>Önerilen değerler dolduruldu.</b> Hepsini dilediğin gibi değiştirebilirsin.</div></div>' : '';
     let body = '';
     if (w.step === 0) {
-      body = `<p class="muted small" style="margin-top:0">Maaşın ve varsa ek gelirlerin. Bir ay ek gelir olmazsa o ay ana sayfadan silebilirsin.</p>
+      body = `<p class="muted small" style="margin-top:0">Önce gelirlerin. Maaşın ve varsa ek gelirlerin — bir ay ek gelir olmazsa o ay ana sayfadan silebilirsin.</p>
         ${p.incomes.map((x, idx) => `<div class="wrow"><input class="input" data-f="inc-name" data-id="${x.id}" value="${esc(x.name)}" placeholder="${idx ? 'Ek gelir adı' : 'Maaş'}">
           <input class="input" data-f="inc-amt" data-id="${x.id}" inputmode="decimal" value="${amtStr(x.amount)}" placeholder="₺0">
           <button type="button" class="x" data-del="inc" data-id="${x.id}" aria-label="Sil">✕</button></div>`).join('')}
         <button type="button" class="link-btn" data-add="inc">+ Ek gelir ekle</button>
         <div class="wbox" style="margin-top:12px">Toplam gelir<div class="big" id="w-a">${money(t.income)}</div></div>`;
     } else if (w.step === 1) {
-      const custom = p.categories.filter((c) => !SUGGEST_CATS.some((s) => lower(s.name) === lower(c.name)));
-      body = `<p class="muted small" style="margin-top:0">Hangi kategorilerde harcama yapıyorsun? Dokunarak seç; alt başlık ekleyebilir, silebilirsin.</p>
-        <div class="chips">${SUGGEST_CATS.map((s) => `<button type="button" data-tog="${esc(s.name)}" class="${p.categories.some((c) => lower(c.name) === lower(s.name)) ? 'on' : ''}">${s.emoji} ${esc(s.name)}</button>`).join('')}
-          ${custom.map((c) => `<button type="button" class="on" data-tog="${esc(c.name)}">${esc(c.emoji || '•')} ${esc(c.name)}</button>`).join('')}</div>
-        <div class="wrow" style="grid-template-columns:1fr auto"><input class="input" id="w-newcat" placeholder="Kendi kategorin (ör. Kahve)"><button type="button" class="btn small" data-add="cat">Ekle</button></div>
-        <div class="section-title">Seçtiklerin (${p.categories.length})</div>
-        ${p.categories.map((c) => `<div class="wcat">
-          <div class="wcat-h"><span style="font-size:20px">${esc(c.emoji || '•')}</span><input class="input" data-f="cat-name" data-id="${c.id}" value="${esc(c.name)}"><button type="button" class="x" data-del="cat" data-id="${c.id}">✕</button></div>
-          <div class="subs">${(c.subs || []).map((s) => `<span class="chip neutral">${esc(s.name)} <button type="button" class="x-s" data-delsub="${c.id}" data-sid="${s.id}">✕</button></span>`).join('')}
-            <input class="input sub-in" data-addsub="${c.id}" placeholder="+ alt başlık"></div>
-          <label class="check slim"><input type="checkbox" data-f="cat-sav" data-id="${c.id}" ${c.toSavings ? 'checked' : ''}> Artarsa birikime aktar</label>
-        </div>`).join('')}`;
-    } else if (w.step === 2) {
       const curInst = w.inst.filter((i) => instActive(i, now) || instFrom(i) > now);
-      body = `<p class="muted small" style="margin-top:0">Her ay düzenli ödediklerin: kira, kredi kartı, fatura, abonelik, kurs…</p>
+      body = `<p class="muted small" style="margin-top:0">Her ay ödemek zorunda olduğun sabit giderler: fatura, kira, kredi kartı, abonelik, kurs… ve taksitlerin. Tutarlarını yaz.</p>
         <div class="chips">${SUGGEST_FIXED.filter(([n]) => !p.fixed.some((f) => lower(f.name) === lower(n))).map(([n, e]) => `<button type="button" data-addfix="${n}" data-e="${e}">${e} ${n}</button>`).join('')}</div>
         ${p.fixed.map((x) => `<div class="wrow emoji"><input class="input" data-f="fix-emoji" data-id="${x.id}" value="${esc(x.emoji || '')}" style="text-align:center">
           <input class="input" data-f="fix-name" data-id="${x.id}" value="${esc(x.name)}" placeholder="Ad">
@@ -1594,19 +1689,18 @@
         <button type="button" class="link-btn" data-add="fix">+ Başka sabit gider ekle</button>
         <div class="section-title">Taksitlerin</div>
         ${curInst.map((i) => `<div class="wrow" style="grid-template-columns:1fr 36px"><div class="small"><b>${esc(i.name)}</b> · ayda ${money(i.monthly)} · ${clamp(monthDiff(i.start, now) + 1, 0, i.count)}/${i.count}</div><button type="button" class="x" data-del="inst" data-id="${i.id}">✕</button></div>`).join('')}
-        ${w.newInst.length ? '<div class="small muted" style="margin-bottom:6px">Ad · aylık tutar · kalan taksit sayısı</div>' : ''}
+        ${w.newInst.length ? '<div class="small muted" style="margin-bottom:6px">Ne aldın · aylık tutar · kalan taksit sayısı</div>' : ''}
         ${w.newInst.map((i) => `<div class="wrow three"><input class="input" data-f="ni-name" data-id="${i.id}" value="${esc(i.name)}" placeholder="ör. Telefon">
           <input class="input" data-f="ni-amt" data-id="${i.id}" inputmode="decimal" value="${amtStr(i.monthly)}" placeholder="₺/ay">
           <input class="input" data-f="ni-cnt" data-id="${i.id}" inputmode="numeric" value="${i.count || ''}" placeholder="adet">
           <button type="button" class="x" data-del="ninst" data-id="${i.id}">✕</button></div>`).join('')}
         <button type="button" class="link-btn" data-add="ninst">+ Taksit ekle</button>
         <div class="wbox" style="margin-top:12px">Sabit ${money(t.fixed)} + taksit ${money(t.taksit)}<div class="big" id="w-a">${money(t.fixed + t.taksit)}</div><span class="small muted">Gelirden sonra kalan: <b id="w-b">${money(t.afterFixed)}</b></span></div>`;
-    } else if (w.step === 3) {
+    } else if (w.step === 2) {
       const sug = suggestPlan(t.income, t.fixed + t.taksit, p.categories).saving;
       const goals = state.savings.goals;
       const quick = [['CEYREK', 1, '🪙 Her ay 1 çeyrek'], ['GRAM', 1, '🟨 Her ay 1 gram'], ['USD', 100, '💵 Her ay 100 $'], ['TRY', 0, '🏦 TL birikim']];
-      body = `<p class="muted small" style="margin-top:0">Önce birikimini ayır, harcamaları kalandan yap. Her ay ne biriktirmeyi planlıyorsun? Ay içinde “Aldım” dediğinde maaşından düşer ve hedefin ilerler.</p>
-        <div class="wbox">Gelir − sabit giderler − taksitler<div class="big">${money(t.afterFixed)}</div></div>
+      body = `${sugNote}<p class="muted small" style="margin-top:0">Sabit giderlerden sonra elinde <b>${money(t.afterFixed)}</b> kalıyor. Önce birikimini ayır; ay içinde “Aldım” dediğinde maaşından düşer ve hedefin ilerler.</p>
         <div class="chips">${quick.map(([ty, q, n]) => `<button type="button" data-addsi="${ty}" data-q="${q}">${n}</button>`).join('')}
           <button type="button" data-addsi="TRY" data-q="0" data-amt="${sug}">✨ Önerilen ${money(sug)}</button></div>
         ${p.savingItems.map((i) => `<div class="wcat">
@@ -1616,33 +1710,48 @@
             <button type="button" class="x" data-del="si" data-id="${i.id}">✕</button></div>
           <div class="small muted" style="margin-top:6px">Ayda ≈ <b id="est-${i.id}">${money(estItem(i))}</b>${i.type !== 'TRY' ? ' (bugünkü satış fiyatıyla)' : ''}
           ${goals.length ? ` · Hedef: <select class="input" data-f="si-goal" data-id="${i.id}" style="display:inline-block;width:auto;padding:4px 28px 4px 8px;font-size:13px"><option value="">Genel</option>${goals.map((g) => `<option value="${g.id}" ${g.id === i.goalId ? 'selected' : ''}>${esc(g.emoji || '')} ${esc(g.name)}</option>`).join('')}</select>` : ''}</div>
-        </div>`).join('') || '<p class="small muted">Şimdilik düzenli birikim yok. Yukarıdan ekleyebilirsin.</p>'}
-        <p class="hint">Önerilen: gelirinin %20'si, ama sabit giderlerden sonra kalanın en fazla %40'ı (${money(sug)}). Altın/döviz tutarı her ay kura göre değişir.</p>
-        <div class="wbox">Aylık birikim ≈ <b id="w-b2">${money(t.saving)}</b> · sonrasında kalan (kategorilere dağıtacağın)<div class="big ${t.kalan < 0 ? 'bad' : ''}" id="w-a">${money(t.kalan)}</div></div>`;
-    } else if (w.step === 4) {
+        </div>`).join('') || '<p class="small muted">Şimdilik düzenli birikim yok. Yukarıdan ekleyebilir ya da bu adımı geçebilirsin.</p>'}
+        <p class="hint">Önerilen: gelirinin %20'si, ama sabit giderlerden sonra kalanın en fazla %40'ı (${money(sug)}).</p>
+        <div class="wbox">Aylık birikim ≈ <b id="w-b2">${money(t.saving)}</b> · sonrasında harcamalara kalan<div class="big ${t.kalan < 0 ? 'bad' : ''}" id="w-a">${money(t.kalan)}</div></div>`;
+    } else if (w.step === 3) {
+      const custom = p.categories.filter((c) => !SUGGEST_CATS.some((s) => lower(s.name) === lower(c.name)));
       const sp = suggestPlan(t.income, t.fixed + t.taksit, p.categories);
-      body = `<div class="wbox">Kalan (dağıtılabilir)<div class="big ${t.kalan < 0 ? 'bad' : ''}">${money(t.kalan)}</div><span class="small muted">Gelir ${money(t.income)} − sabit ${money(t.fixed)} − taksit ${money(t.taksit)} − birikim ${money(t.saving)}</span></div>
-        <p class="muted small">Kalanı kategorilerine sen dağıt. Örneğin İhtiyaçlarım'a kendine ayırdığını yaz.</p>
-        ${p.categories.map((c) => `<div class="dist-row"><div><div style="font-weight:600">${esc(c.emoji || '•')} ${esc(c.name)}</div>${(c.subs || []).length ? `<div>${c.subs.map((s) => `<span class="pill-sub">${esc(s.name)}</span>`).join('')}</div>` : ''}</div>
-          <input class="input" data-f="cat-plan" data-id="${c.id}" inputmode="decimal" value="${amtStr(c.planned)}" placeholder="₺0"></div>`).join('') || '<p class="muted small">Kategori seçmedin; geri dönüp seçebilirsin.</p>'}
+      body = `${sugNote}<div class="wbox">Harcamalarına kalan<div class="big ${t.kalan < 0 ? 'bad' : ''}">${money(t.kalan)}</div><span class="small muted">Gelir ${money(t.income)} − sabit ${money(t.fixed)} − taksit ${money(t.taksit)} − birikim ${money(t.saving)}</span></div>
+        <p class="muted small">Kalan parayla ne yapmak istiyorsun? Kategorileri seç ve her birine bütçe yaz. <b>Alt başlık eklersen kategori bütçesi üst limit olur</b> — ör. Kıyafet ₺5.000 → Ayakkabı ₺1.000, Giyim ₺4.000.</p>
+        <div class="chips">${SUGGEST_CATS.map((s) => `<button type="button" data-tog="${esc(s.name)}" class="${p.categories.some((c) => lower(c.name) === lower(s.name)) ? 'on' : ''}">${s.emoji} ${esc(s.name)}</button>`).join('')}
+          ${custom.map((c) => `<button type="button" class="on" data-tog="${esc(c.name)}">${esc(c.emoji || '•')} ${esc(c.name)}</button>`).join('')}</div>
+        <div class="wrow" style="grid-template-columns:1fr auto"><input class="input" id="w-newcat" placeholder="Kendi kategorin (ör. Kıyafet)"><button type="button" class="btn small" data-add="cat">Ekle</button></div>
+        ${p.categories.map((c) => `<div class="wcat">
+          <div class="wcat-h"><span style="font-size:20px">${esc(c.emoji || '•')}</span><input class="input" data-f="cat-name" data-id="${c.id}" value="${esc(c.name)}">
+            <input class="input amt-in" data-f="cat-plan" data-id="${c.id}" inputmode="decimal" value="${amtStr(c.planned)}" placeholder="₺0"><button type="button" class="x" data-del="cat" data-id="${c.id}">✕</button></div>
+          ${(c.subs || []).map((s) => `<div class="subrow"><span class="tree">└</span><input class="input" data-f="sub-name" data-cat="${c.id}" data-id="${s.id}" value="${esc(s.name)}">
+            <input class="input amt-in" data-f="sub-plan" data-cat="${c.id}" data-id="${s.id}" inputmode="decimal" value="${amtStr(s.planned)}" placeholder="₺0"><button type="button" class="x" data-delsub="${c.id}" data-sid="${s.id}">✕</button></div>`).join('')}
+          <div class="subrow"><span class="tree">└</span><input class="input sub-in2" data-addsub="${c.id}" placeholder="+ alt başlık ekle (ör. Ayakkabı)"></div>
+          <div class="subsum" id="ss-${c.id}">${subSumText(c)}</div>
+          <label class="check slim"><input type="checkbox" data-f="cat-sav" data-id="${c.id}" ${c.toSavings ? 'checked' : ''}> Ay sonunda artarsa birikime aktar</label>
+        </div>`).join('') || '<p class="muted small">Henüz kategori seçmedin.</p>'}
         <div class="wbox" style="margin-top:12px">Dağıtılmamış (serbest cep)<div class="big" id="w-a">${money(t.unalloc)}</div><span class="small muted">Ay sonunda harcanmazsa birikime aktarabilirsin.</span></div>
         <button type="button" class="btn secondary" data-act="suggest">✨ Önerilen dağılımı uygula</button>
         <details style="margin-top:10px"><summary class="small muted">Önerilen dağılım nasıl hesaplanıyor?</summary>
-          <p class="small muted">Kalanın %95'i kategorilerin önemine göre bölünür, %5'i (${money(sp.rest * 0.05)}) beklenmedik giderler için serbest bırakılır.</p>
-          <ul class="list small">${p.categories.map((c) => `<li><div class="main"><div class="title">${esc(c.emoji || '')} ${esc(c.name)}</div><div class="sub">${esc(whyOf(c.name))}</div></div><div class="amt">${money(Math.round(((t.kalan * 0.95) * weightOf(c.name)) / (sum(p.categories, (x) => weightOf(x.name)) || 1) / 50) * 50)}</div></li>`).join('')}</ul></details>`;
+          <p class="small muted">Kalanın %95'i kategorilerin önemine göre bölünür, %5'i (${money(Math.max(0, t.kalan) * 0.05)}) beklenmedik giderler için serbest kalır. Alt başlıklar kategori bütçesinin içinden bölünür.</p>
+          <ul class="list small">${p.categories.map((c) => `<li><div class="main"><div class="title">${esc(c.emoji || '')} ${esc(c.name)}</div><div class="sub">${esc(whyOf(c.name))}</div></div><div class="amt">${money(round50((Math.max(0, t.kalan) * 0.95 * weightOf(c.name)) / (sum(p.categories, (x) => weightOf(x.name)) || 1)))}</div></li>`).join('')}</ul></details>`;
+      void sp;
     } else {
+      const bad = p.categories.filter((c) => (c.subs || []).length && sum(c.subs, 'planned') > c.planned);
       body = `<ul class="wf">
           <li><span class="k">Toplam gelir</span><span class="v">${money(t.income)}</span></li>
           <li class="minus"><span class="k">− Sabit giderler (${p.fixed.length})</span><span class="v">${money(t.fixed)}</span></li>
           <li class="minus"><span class="k">− Taksitler</span><span class="v">${money(t.taksit)}</span></li>
           <li class="minus"><span class="k">− Birikim${p.savingItems.length ? ` <span class="muted tiny">(${p.savingItems.map((i) => esc(itemLabel(i))).join(', ')})</span>` : ''}</span><span class="v">${money(t.saving)}</span></li>
-          <li class="total"><span class="k">= Kalan</span><span class="v ${t.kalan < 0 ? 'bad' : ''}">${money(t.kalan)}</span></li>
-          ${p.categories.map((c) => `<li class="sub"><span class="k">${esc(c.emoji || '')} ${esc(c.name)}${(c.subs || []).length ? ` <span class="muted tiny">(${c.subs.map((s) => esc(s.name)).join(', ')})</span>` : ''}</span><span class="v">${money(c.planned)}</span></li>`).join('')}
+          <li class="total"><span class="k">= Harcamalarına kalan</span><span class="v ${t.kalan < 0 ? 'bad' : ''}">${money(t.kalan)}</span></li>
+          ${p.categories.map((c) => `<li class="sub"><span class="k">${esc(c.emoji || '')} ${esc(c.name)}</span><span class="v">${money(c.planned)}</span></li>
+            ${(c.subs || []).map((s) => `<li class="sub" style="padding-left:18px"><span class="k muted">└ ${esc(s.name)}</span><span class="v muted">${money(s.planned)}</span></li>`).join('')}`).join('')}
           <li class="sub"><span class="k">Dağıtılmamış</span><span class="v ${t.unalloc < 0 ? 'bad' : 'good'}">${money(t.unalloc)}</span></li>
         </ul>
         ${t.unalloc < 0 ? `<p class="small bad">⚠︎ Kategorilere kalandan ${money(-t.unalloc)} fazla dağıttın.</p>` : ''}
+        ${bad.map((c) => `<p class="small bad">⚠︎ ${esc(c.name)}: alt bütçeler limiti aşıyor.</p>`).join('')}
         <label class="check" style="margin-top:12px"><input type="checkbox" id="w-apply" ${w.apply ? 'checked' : ''}> Bu aya da uygula (${monthName(now)}) — harcamaların korunur</label>
-        <p class="hint">Plan her yeni ayda otomatik kullanılır. İstediğin zaman Ayarlar → Planım'dan değiştirebilirsin.</p>`;
+        <p class="hint">Plan her yeni ayda otomatik kullanılır. Değiştirmediğin sürece aynı planla devam edersin; değiştirirsen yeni planla ilerlersin. Ayarlar → Planım.</p>`;
     }
     const html = `<div class="wstep">Adım ${w.step + 1} / ${WSTEPS.length}</div>
       <div class="wdots">${WSTEPS.map((_, i) => `<i class="${i <= w.step ? 'on' : ''}"></i>`).join('')}</div>
@@ -1655,25 +1764,30 @@
     const find = (arr, id) => arr.find((x) => x.id === id);
     const live = () => {
       const t = wTotals(w), a = $('#w-a', root), b = $('#w-b', root);
-      if (!a) return;
-      const val = w.step === 0 ? t.income : w.step === 2 ? t.fixed + t.taksit : w.step === 3 ? t.kalan : t.unalloc;
-      a.textContent = money(val); a.classList.toggle('bad', val < 0);
+      if (a) {
+        const val = w.step === 0 ? t.income : w.step === 1 ? t.fixed + t.taksit : w.step === 2 ? t.kalan : t.unalloc;
+        a.textContent = money(val); a.classList.toggle('bad', val < 0);
+      }
       if (b) b.textContent = money(t.afterFixed);
       const b2 = $('#w-b2', root); if (b2) b2.textContent = money(t.saving);
-      if (w.step === 3) p.savingItems.forEach((i) => { const e = $(`#est-${i.id}`, root); if (e) e.textContent = money(estItem(i)); });
+      if (w.step === 2) p.savingItems.forEach((i) => { const e = $(`#est-${i.id}`, root); if (e) e.textContent = money(estItem(i)); });
+      if (w.step === 3) p.categories.forEach((c) => { const e = $(`#ss-${c.id}`, root); if (e) e.innerHTML = subSumText(c); });
     };
     $$('[data-f]', root).forEach((el) => {
-      if (el.dataset.f === 'si-type') { el.onchange = () => { const i = find(p.savingItems, el.dataset.id); i.type = el.value; if (i.type === 'TRY') { i.amount = i.amount || 0; } else { i.qty = i.qty || 1; } drawWizard(w); }; return; }
+      if (el.dataset.f === 'si-type') { el.onchange = () => { const i = find(p.savingItems, el.dataset.id); i.type = el.value; if (i.type !== 'TRY') i.qty = i.qty || 1; drawWizard(w); }; return; }
       if (el.dataset.f === 'si-goal') { el.onchange = () => { find(p.savingItems, el.dataset.id).goalId = el.value || null; }; return; }
       const ev = el.type === 'checkbox' ? 'change' : 'input';
       el.addEventListener(ev, () => {
         const id = el.dataset.id, v = el.value;
+        const sub = () => find(find(p.categories, el.dataset.cat).subs, id);
         switch (el.dataset.f) {
           case 'inc-name': find(p.incomes, id).name = v; break;
           case 'inc-amt': find(p.incomes, id).amount = amt0(v); break;
           case 'cat-name': find(p.categories, id).name = v; break;
           case 'cat-sav': find(p.categories, id).toSavings = el.checked; break;
           case 'cat-plan': find(p.categories, id).planned = amt0(v); break;
+          case 'sub-name': sub().name = v; break;
+          case 'sub-plan': sub().planned = amt0(v); break;
           case 'fix-emoji': find(p.fixed, id).emoji = v; break;
           case 'fix-name': find(p.fixed, id).name = v; break;
           case 'fix-amt': find(p.fixed, id).amount = amt0(v); break;
@@ -1717,49 +1831,55 @@
       const n = b.dataset.tog;
       const ex = p.categories.find((c) => lower(c.name) === lower(n));
       if (ex) p.categories = p.categories.filter((c) => c !== ex);
-      else { const s = SUGGEST_CATS.find((x) => x.name === n); p.categories.push({ id: uid(), name: s.name, emoji: s.emoji, planned: 0, subs: (s.subs || []).map((y) => ({ id: uid(), name: y })), toSavings: !!s.toSavings }); }
+      else p.categories.push(newCat(SUGGEST_CATS.find((x) => x.name === n)));
       drawWizard(w);
     }));
     $$('[data-addsub]', root).forEach((inp) => {
       inp.addEventListener('keydown', (ev) => { if (ev.key === 'Enter') { ev.preventDefault(); inp.blur(); } });
-      inp.onchange = () => { const n = inp.value.trim(); if (!n) return; const c = find(p.categories, inp.dataset.addsub); c.subs = c.subs || []; c.subs.push({ id: uid(), name: n }); drawWizard(w); };
+      inp.onchange = () => {
+        const n = inp.value.trim(); if (!n) return;
+        const c = find(p.categories, inp.dataset.addsub); c.subs = c.subs || [];
+        const free = Math.max(0, (+c.planned || 0) - sum(c.subs, 'planned'));
+        c.subs.push({ id: uid(), name: n, planned: free });
+        drawWizard(w);
+      };
     });
     $$('[data-delsub]', root).forEach((b) => (b.onclick = () => { const c = find(p.categories, b.dataset.delsub); c.subs = c.subs.filter((s) => s.id !== b.dataset.sid); drawWizard(w); }));
     $$('[data-addfix]', root).forEach((b) => (b.onclick = () => { p.fixed.push({ id: uid(), name: b.dataset.addfix, emoji: b.dataset.e, amount: 0 }); drawWizard(w); setTimeout(() => { const ins = $$('[data-f="fix-amt"]'); ins.length && ins[ins.length - 1].focus(); }, 60); }));
     const sg = $('[data-act="suggest"]', root);
-    if (sg) sg.onclick = () => {
-      const t = wTotals(w);
-      const wsum = sum(p.categories, (c) => weightOf(c.name)) || 1;
-      p.categories.forEach((c) => (c.planned = round50((Math.max(0, t.kalan) * 0.95 * weightOf(c.name)) / wsum)));
-      drawWizard(w); toast('Önerilen dağılım uygulandı — istediğini değiştir');
-    };
+    if (sg) sg.onclick = () => { applySuggestion(w, false); drawWizard(w); toast('Önerilen dağılım uygulandı — istediğini değiştir'); };
     const ap = $('#w-apply', root); if (ap) ap.onchange = () => (w.apply = ap.checked);
     $$('[data-nav]', root).forEach((b) => (b.onclick = () => {
       const d = +b.dataset.nav;
       if (d > 0 && w.step === 0 && !(sum(p.incomes, 'amount') > 0)) return toast('Gelirini gir');
+      if (d > 0 && w.step === 3) {
+        const bad = p.categories.find((c) => (c.subs || []).length && sum(c.subs, 'planned') > c.planned);
+        if (bad) return toast(`${bad.name}: alt bütçelerin toplamı kategori limitini aşamaz`);
+      }
       if (d > 0 && w.step === WSTEPS.length - 1) return saveWizard(w);
       w.step = clamp(w.step + d, 0, WSTEPS.length - 1);
+      if (w.mode === 'suggested' && !w.suggested && w.step === 2) { applySuggestion(w, true); w.suggested = true; }
       drawWizard(w);
     }));
   }
   function saveWizard(w) {
     const now = monthKeyOf();
-    w.newInst.filter((x) => x.name && x.monthly > 0 && x.count > 0).forEach((x) => w.inst.push({ id: uid(), name: x.name.trim(), emoji: '🧾', monthly: x.monthly, count: x.count, start: now }));
+    w.newInst.filter((x) => x.name && x.monthly > 0 && x.count > 0).forEach((x) => w.inst.push({ id: uid(), name: x.name.trim(), emoji: '🧾', monthly: x.monthly, count: x.count, start: now, from: now }));
     const p = w.plan;
     p.incomes = p.incomes.filter((i) => i.name.trim() && i.amount > 0).map((i) => ({ ...i, name: i.name.trim() }));
     p.fixed = p.fixed.filter((f) => f.name.trim() && f.amount > 0).map((f) => ({ ...f, name: f.name.trim() }));
-    p.categories = p.categories.filter((c) => c.name.trim()).map((c) => ({ ...c, name: c.name.trim() }));
+    p.categories = p.categories.filter((c) => c.name.trim()).map((c) => ({ ...c, name: c.name.trim(), subs: (c.subs || []).filter((s) => s.name.trim()).map((s) => ({ ...s, name: s.name.trim() })) }));
     p.savingItems = (p.savingItems || []).filter((i) => (i.type === 'TRY' ? i.amount > 0 : i.qty > 0)).map((i) => {
       const r = rateOf(i.type);
       return { ...i, lastPrice: r ? r.sell : i.lastPrice };
     });
-    delete p.saving;
+    delete p.saving; delete p.empty;
     p.reviewed = true;
     state.plan = p;
     state.installments = w.inst;
     if (w.apply) {
       if (!state.months[now]) buildMonth(now);
-      else { state.months[now].skip = []; }
+      else { state.months[now].skip = []; delete state.months[now].detached; }
       state.ui.month = now;
     }
     monthKeys().filter((k) => (w.apply ? k >= now : k > now)).forEach((k) => syncMonth(k, null));
@@ -1976,7 +2096,7 @@
     $$('[data-h]', view).forEach((li) => (li.onclick = () => holdingForm(state.savings.holdings.find((h) => h.id === li.dataset.h))));
     $('#add-goal').onclick = () => goalForm();
     $$('[data-goal]', view).forEach((c) => (c.onclick = () => goalForm(goals.find((g) => g.id === c.dataset.goal))));
-    $('#edit-si').onclick = () => openWizard(state.plan ? 'edit' : 'first', 3);
+    $('#edit-si').onclick = () => openWizard(state.plan ? 'edit' : 'first', 2);
     $('#ref').onclick = () => refreshRates({ force: true });
     $$('[data-rate]', view).forEach((el) => (el.onclick = () => rateOverrideForm(el.dataset.rate, el.dataset.name)));
   }
@@ -2129,10 +2249,21 @@
           <li class="total"><span class="k">= Kalan</span><span class="v">${money(pt.income - pt.fixed - pt.taksit - planSavingTotal(p))}</span></li>
           <li class="sub"><span class="k">${p.categories.length} kategoriye ayrılan</span><span class="v">${money(pt.alloc)}</span></li>
         </ul>
-        <button class="btn" id="plan-edit" style="margin-top:10px">Planımı düzenle</button>
-        <div class="btn-row"><button class="btn secondary" id="plan-sug">Önerilen plan</button><button class="btn secondary" id="plan-new">Sıfırdan oluştur</button></div>
-        <p class="hint">Plan her yeni ayda otomatik kullanılır. Değişiklikler bu ay ve sonraki aylara uygulanır; geçmiş aylar korunur.</p>`
-        : `<p class="small muted" style="margin-top:0">Henüz planın yok.</p><button class="btn" id="plan-new">Planımı oluştur</button>`}
+        ${p.empty ? '<p class="small muted">Şu an <b>boş plan</b> kullanıyorsun.</p>' : `<button class="btn" id="plan-edit" style="margin-top:10px">Planımı düzenle</button>`}
+        <div class="btn-row"><button class="btn secondary" id="plan-new">Kendim oluşturayım</button><button class="btn secondary" id="plan-sugw">Önerilen plan</button></div>
+        <div class="btn-row">${p.empty ? '' : '<button class="btn secondary" id="plan-sug">Önerilenle karşılaştır</button>'}<button class="btn secondary" id="plan-empty">Boş plan</button></div>
+        <div class="btn-row"><button class="btn secondary" id="month-blank">Sadece ${monthName(curMonthKey())} boş olsun</button></div>
+        <p class="hint">Plan her yeni ayda otomatik kullanılır; değiştirmediğin sürece aynı planla devam edersin. Değişiklikler bu ay ve sonraki aylara uygulanır, geçmiş aylar korunur. “Sadece bu ay boş” seçersen o ay plandan etkilenmez.</p>`
+        : `<p class="small muted" style="margin-top:0">Henüz planın yok.</p>${planChoiceHTML()}`}
+      </div>
+      <div class="card">
+        <h3>👤 Hesabım</h3>
+        <ul class="list"><li><div class="main"><div class="title">${esc(state.user.name)}</div><div class="sub">Kullanıcı adın</div></div><b>@${esc(state.user.handle)}#${esc(state.user.tag)}</b></li></ul>
+        <p class="small muted">Başka bir telefonda, tablette ya da bilgisayarda kullanmak için <b>taşıma linki</b> oluştur ve o cihazda aç. Tüm planın, harcamaların ve birikimlerin oraya kopyalanır.</p>
+        <button class="btn" id="mk-link">Başka cihazda kullan — link oluştur</button>
+        <div id="link-box" hidden style="margin-top:10px"><textarea class="input" id="link-ta" rows="3" readonly></textarea>
+          <div class="btn-row"><button class="btn secondary" id="link-copy">Kopyala</button>${navigator.share ? '<button class="btn secondary" id="link-share">Paylaş</button>' : ''}</div>
+          <p class="hint">⚠︎ Link tüm finansal verilerini içerir; sadece kendine gönder. Bu bir kopyadır: cihazlar birbirini otomatik güncellemez — hangi cihazda devam edeceksen ona taşı.</p></div>
       </div>
       <div class="card">
         <h3>Profil</h3>
@@ -2164,7 +2295,30 @@
       <p class="hint" style="text-align:center">Finansım · üyelik yok · verilerin hiçbir sunucuya gönderilmez (yalnızca kur bilgisi çekilir)</p>`;
     const pe = $('#plan-edit'); if (pe) pe.onclick = () => openWizard('edit');
     const ps = $('#plan-sug'); if (ps) ps.onclick = suggestionSheet;
-    $('#plan-new').onclick = () => { if (!p || confirm('Mevcut planın yerine sıfırdan yeni bir plan oluşturulsun mu? (Geçmiş ayların ve harcamaların korunur)')) openWizard('new'); };
+    if (!p) bindPlanChoice(view);
+    const psw = $('#plan-sugw'); if (psw) psw.onclick = () => { if (confirm('Önerilen planla yeni bir plan oluşturulsun mu? (Geçmiş ayların korunur)')) openWizard('suggested'); };
+    const pem = $('#plan-empty'); if (pem) pem.onclick = () => { if (confirm('Boş plana geçilsin mi? Bu ay ve sonraki aylarda plan kalemleri kalkar (harcaması olanlar korunur).')) { setEmptyPlan(); syncFuture(null); save(); renderView(); } };
+    const mb = $('#month-blank'); if (mb) mb.onclick = () => {
+      const k = curMonthKey(), m = getMonth(k);
+      if (!confirm(`${monthName(k)} boş plana çevrilsin mi? Harcaması olmayan plan kalemleri bu aydan kalkar; sonraki aylar planınla devam eder.`)) return;
+      if (!m) state.months[k] = { incomes: [], categories: [], expenses: [], saving: { done: 0, items: [] }, skip: [], detached: true };
+      else {
+        const used = new Set(m.expenses.map((e) => e.catId));
+        m.categories = m.categories.filter((c) => used.has(c.id) || c.instId);
+        m.incomes = m.incomes.filter((i) => !i.tplId);
+        m.saving.items = m.saving.items.filter((i) => i.done);
+        m.detached = true;
+      }
+      save(); toast(`${monthName(k)} boş plana çevrildi`); location.hash = '#/ozet';
+    };
+    $('#mk-link').onclick = async () => {
+      const link = await encodeTransfer();
+      $('#link-ta').value = link; $('#link-box').hidden = false;
+      toast(`Link hazır (${Math.round(link.length / 1024)} KB)`);
+    };
+    $('#link-copy').onclick = async () => { const ta = $('#link-ta'); try { await navigator.clipboard.writeText(ta.value); } catch { ta.select(); document.execCommand('copy'); } toast('Kopyalandı'); };
+    const lsh = $('#link-share'); if (lsh) lsh.onclick = () => navigator.share({ title: 'Finansım taşıma linki', url: $('#link-ta').value }).catch(() => {});
+    const pn = $('#plan-new'); if (pn) pn.onclick = () => { if (confirm('Kendi planını sıfırdan oluşturmak ister misin? (Geçmiş ayların ve harcamaların korunur)')) openWizard('new'); };
     $('#name').onchange = (e) => { state.user.name = e.target.value.trim() || state.user.name; save(); updateHeader(); };
     $$('#theme button').forEach((b) => (b.onclick = () => { state.settings.theme = b.dataset.v; save(); applyTheme(); renderAyarlar(); }));
     $('#pin-set').onclick = () => openSheet('PIN belirle', `
@@ -2224,27 +2378,61 @@
     let ob = $('#onboard');
     if (!ob) { ob = document.createElement('div'); ob.id = 'onboard'; document.body.appendChild(ob); }
     ob.className = 'onboard';
+    const enterApp = () => { save(); ob.remove(); $('#app').hidden = false; location.hash = '#/ozet'; render(); refreshRates(); };
+    if (pendingTransfer) {
+      ob.innerHTML = `<div class="card"><div style="font-size:42px">📲</div><h1>Verilerin taşınıyor</h1>
+        <p class="muted" style="margin-top:0">Başka cihazdan gönderdiğin taşıma linkiyle açtın. Tüm planın, harcamaların ve birikimlerin bu cihaza yüklenecek.</p>
+        <button class="btn" id="tr-ok">Verilerimi yükle</button><div class="btn-row"><button class="btn secondary" id="tr-no">Yeni başla</button></div></div>`;
+      $('#tr-ok').onclick = async () => {
+        const d = await decodeTransfer(pendingTransfer);
+        pendingTransfer = null;
+        if (!d) { toast('Taşıma linki okunamadı'); return renderOnboarding(); }
+        state = d; unlocked = true; autoRollover(); toast(`Hoş geldin ${state.user.name} — verilerin yüklendi`); enterApp();
+      };
+      $('#tr-no').onclick = () => { pendingTransfer = null; renderOnboarding(); };
+      return;
+    }
+    // 1. adım: ad + kullanıcı adı
     ob.innerHTML = `<div class="card">
       <div style="font-size:42px">💰</div>
       <h1>Finansım'a hoş geldin</h1>
-      <p class="muted" style="margin-top:0">Üyelik yok. Her şey yalnızca bu cihazda saklanır. Adını yaz, sonra birkaç adımda planını birlikte kuralım.</p>
+      <p class="muted" style="margin-top:0">Şifre yok, e-posta yok. Verilerin bu cihazda saklanır.</p>
       <form id="ob-f">
-        <div class="field"><label>Adın</label><input class="input" name="name" placeholder="Adını yaz" required autocomplete="given-name"></div>
+        <div class="field"><label>Adın</label><input class="input" name="name" placeholder="ör. Eda" required autocomplete="given-name"></div>
+        <div class="field"><label>Kullanıcı adın</label><input class="input" name="handle" placeholder="ör. edaatosun" required autocapitalize="none" autocomplete="username" pattern="[a-zA-Z0-9._]{3,20}">
+          <div class="hint">3–20 karakter: harf, rakam, nokta, alt çizgi. Sonuna sana özel 4 haneli bir kod eklenir (ör. @eda#4821).</div></div>
         ${pendingCode ? `<label class="check"><input type="checkbox" name="usecode" checked> ${monthName(pendingCode.m)} planımı ve harcamalarımı yükle (linkten geldi)</label>`
-          : `<details class="small" style="margin-bottom:12px"><summary class="muted">Veri kodum var</summary><textarea class="input" name="code" rows="3" style="margin-top:8px" placeholder="Link ya da kod"></textarea></details>`}
-        <button class="btn" type="submit">Başla</button>
+          : `<details class="small" style="margin-bottom:12px"><summary class="muted">Başka cihazdan geliyorum / veri kodum var</summary><textarea class="input" name="code" rows="3" style="margin-top:8px" placeholder="Taşıma linki ya da veri kodu"></textarea></details>`}
+        <button class="btn" type="submit">Devam</button>
       </form></div>`;
-    $('#ob-f').onsubmit = (e) => {
+    const f0 = $('#ob-f');
+    f0.name.oninput = () => { if (!f0.handle.dataset.touched) f0.handle.value = slugHandle(f0.name.value); };
+    f0.handle.oninput = () => (f0.handle.dataset.touched = '1');
+    f0.onsubmit = async (e) => {
       e.preventDefault();
       const f = e.target;
-      state = freshState(f.name.value.trim());
-      const code = pendingCode && f.usecode && f.usecode.checked ? pendingCode : f.code ? decodeCode(f.code.value) : null;
-      if (f.code && f.code.value.trim() && !code) { state = null; return toast('Veri kodu okunamadı'); }
+      const raw = f.code ? f.code.value.trim() : '';
+      if (raw && /#tasi=|^[zj][A-Za-z0-9_-]{40,}$/.test(raw)) {
+        const d = await decodeTransfer(raw);
+        if (!d) return toast('Taşıma linki okunamadı');
+        state = d; unlocked = true; autoRollover(); return enterApp();
+      }
+      const handle = slugHandle(f.handle.value);
+      if (handle.length < 3) return toast('Kullanıcı adı en az 3 karakter olmalı');
+      state = freshState(f.name.value.trim(), handle);
+      const code = pendingCode && f.usecode && f.usecode.checked ? pendingCode : raw ? decodeCode(raw) : null;
+      if (raw && !code) { state = null; return toast('Veri kodu okunamadı'); }
       if (code) applyCode(code);
       pendingCode = null; unlocked = true;
       autoRollover();
-      save(); ob.remove(); $('#app').hidden = false; location.hash = '#/ozet'; render(); refreshRates();
-      if (!state.plan) setTimeout(() => openWizard('first'), 300);
+      if (state.plan) return enterApp();
+      // 2. adım: plan seçimi — uygulamaya planla girilir
+      ob.innerHTML = `<div class="card">
+        <div style="font-size:42px">🧭</div>
+        <h1>Merhaba ${esc(state.user.name)}!</h1>
+        <p class="muted" style="margin-top:0">Kullanıcı adın <b>@${esc(state.user.handle)}#${esc(state.user.tag)}</b>. Şimdi planını seç; her ay bu planla devam edersin, istediğin zaman Ayarlar'dan değiştirirsin.</p>
+        ${planChoiceHTML()}</div>`;
+      bindPlanChoice(ob, () => { save(); ob.remove(); $('#app').hidden = false; location.hash = '#/ozet'; render(); refreshRates(); });
     };
   }
 
@@ -2280,6 +2468,12 @@
     applyTheme();
     if (!state) return renderOnboarding();
     if (state.settings.pinHash && !unlocked) return renderLock();
+    if (pendingTransfer) {
+      const t = pendingTransfer; pendingTransfer = null;
+      if (confirm('Taşıma linkiyle açtın. Bu cihazdaki veriler linkteki verilerle değiştirilsin mi?')) {
+        decodeTransfer(t).then((d) => { if (!d) return toast('Taşıma linki okunamadı'); state = d; unlocked = true; save(); applyTheme(); toast('Veriler taşındı'); renderView(); });
+      }
+    }
     if (pendingCode) {
       const d = pendingCode; pendingCode = null;
       if (confirm(`Linkteki ${monthName(d.m)} planı ve verileri yüklensin mi?${state.months[d.m] ? ' (Bu ay zaten var, üzerine yazılır.)' : ''}`)) { applyCode(d); save(); toast('Veriler yüklendi'); }
