@@ -1,4 +1,10 @@
-/* Finansım — tüm veriler bu cihazın localStorage'ında tutulur. Kod içinde kişisel veri yoktur. */
+/* Finansım — tüm veriler bu cihazın localStorage'ında tutulur. Kod içinde kişisel veri yoktur.
+ *
+ * Bütçe mantığı (kullanıcının düzeni):
+ *   Gelirler − Sabit giderler − Taksitler − Planlanan birikim = Kalan
+ *   Kalan → kişinin kendi belirlediği kategorilere (alt başlıklarıyla) dağıtılır.
+ * Plan bir kez kurulur (state.plan) ve her yeni ay bu plandan oluşturulur.
+ */
 (() => {
   'use strict';
 
@@ -11,6 +17,7 @@
   const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
   const lower = (s) => String(s || '').toLocaleLowerCase('tr').trim();
   const clamp = (n, a, b) => Math.min(b, Math.max(a, n));
+  const clone = (o) => JSON.parse(JSON.stringify(o));
 
   const nf0 = new Intl.NumberFormat('tr-TR', { maximumFractionDigits: 0 });
   const nf2 = new Intl.NumberFormat('tr-TR', { maximumFractionDigits: 2 });
@@ -19,7 +26,8 @@
   const signed = (n) => (Math.round(n) > 0 ? '+' : '') + money(n);
   const pct = (n) => (n < 0 ? '−' : '') + '%' + nf2.format(Math.abs(Math.round(n * 10) / 10));
   const num = (n) => nf2.format(n || 0);
-  const amtStr = (n) => (n === '' || n == null ? '' : String(n).replace('.', ','));
+  const amtStr = (n) => (n === '' || n == null || n === 0 ? '' : String(n).replace('.', ','));
+  const round50 = (n) => Math.max(0, Math.round(n / 50) * 50);
 
   function parseAmount(v) {
     if (typeof v === 'number') return v;
@@ -30,16 +38,49 @@
     else if (/^\d{1,3}\.\d{3}$/.test(s)) s = s.replace('.', '');
     return parseFloat(s);
   }
+  const amt0 = (v) => { const n = parseAmount(v); return isFinite(n) && n > 0 ? n : 0; };
 
   const MONTHS = ['Ocak', 'Şubat', 'Mart', 'Nisan', 'Mayıs', 'Haziran', 'Temmuz', 'Ağustos', 'Eylül', 'Ekim', 'Kasım', 'Aralık'];
   const pad = (n) => String(n).padStart(2, '0');
   const todayISO = () => { const d = new Date(); return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`; };
   const monthKeyOf = (d = new Date()) => `${d.getFullYear()}-${pad(d.getMonth() + 1)}`;
   const addMonth = (key, n) => { const [y, m] = key.split('-').map(Number); return monthKeyOf(new Date(y, m - 1 + n, 1)); };
+  const monthDiff = (a, b) => { const [ay, am] = a.split('-').map(Number); const [by, bm] = b.split('-').map(Number); return (by - ay) * 12 + (bm - am); };
   const monthName = (key, short) => { const [y, m] = key.split('-').map(Number); const n = MONTHS[m - 1]; return short ? `${n.slice(0, 3)} ${String(y).slice(2)}` : `${n} ${y}`; };
   const daysInMonth = (key) => { const [y, m] = key.split('-').map(Number); return new Date(y, m, 0).getDate(); };
-  const dayLabel = (iso) => { const [y, m, d] = iso.split('-').map(Number); return new Date(y, m - 1, d).toLocaleDateString('tr-TR', { day: 'numeric', month: 'long', weekday: 'long' }); };
   const shortDate = (iso) => { const [y, m, d] = iso.split('-').map(Number); return new Date(y, m - 1, d).toLocaleDateString('tr-TR', { day: 'numeric', month: 'short' }); };
+
+  // ---------- Öneriler ----------
+  const SUGGEST_CATS = [
+    { name: 'İhtiyaçlarım', emoji: '🛍️', subs: ['Kıyafet', 'Kozmetik', 'Ev ihtiyaçları', 'İstediğim bir şey'], toSavings: true, w: 22, def: true, why: 'kıyafet, kozmetik, ev ihtiyacı gibi kişisel alımlar; artanı birikime gider' },
+    { name: 'Market', emoji: '🛒', subs: ['BİM / A101 / Şok', 'Gross / toptan'], w: 30, def: true, why: 'temel ihtiyaç, en büyük pay' },
+    { name: 'Dışarıda yeme-içme', emoji: '🍽️', subs: [], w: 14, def: true, why: 'kafe, restoran, tatlıcı' },
+    { name: 'Gezme / Eğlence', emoji: '✈️', subs: [], w: 10, why: 'gezi, sinema, etkinlik' },
+    { name: 'Yol / Ulaşım', emoji: '🚌', subs: [], w: 12, def: true, why: 'toplu taşıma, taksi, yakıt' },
+    { name: 'Yardım', emoji: '🤝', subs: ['Aile'], w: 8, why: 'aileye / yakınlara destek; ortalama bir tutar ayır' },
+    { name: 'Sağlık', emoji: '💊', subs: [], w: 5, why: 'eczane, muayene' },
+    { name: 'Hediye', emoji: '🎁', subs: [], w: 4, why: 'doğum günü, özel gün' },
+    { name: 'Evcil hayvan', emoji: '🐾', subs: [], w: 6, why: 'mama, veteriner' },
+    { name: 'Kitap / Eğitim', emoji: '📚', subs: [], w: 5, why: 'kitap, kurs materyali' },
+    { name: 'Araba / Yakıt', emoji: '⛽', subs: [], w: 15, why: 'yakıt, otopark, bakım' },
+    { name: 'Değişken faturalar', emoji: '💡', subs: [], w: 8, why: 'tutarı her ay değişen faturalar' },
+  ];
+  const SUGGEST_FIXED = [['Kira', '🏠'], ['Kredi kartı', '💳'], ['Telefon', '📱'], ['İnternet', '🌐'], ['Elektrik', '💡'], ['Su', '🚰'], ['Doğalgaz', '🔥'], ['Aidat', '🏢'], ['Netflix', '🎬'], ['Spotify', '🎵'], ['Spor salonu', '🏋️'], ['Kurs', '📚']];
+  const weightOf = (name) => (SUGGEST_CATS.find((s) => lower(s.name) === lower(name)) || {}).w || 7;
+  const whyOf = (name) => (SUGGEST_CATS.find((s) => lower(s.name) === lower(name)) || {}).why || 'kendi kategorin';
+
+  // Önerilen plan: gelirin %20'si birikim (sabitlerden sonra kalanın en fazla %40'ı),
+  // kalanın %95'i kategorilere ağırlığa göre, %5'i beklenmedik giderler için serbest.
+  function suggestPlan(income, committed, cats) {
+    const afterFixed = Math.max(0, income - committed);
+    const saving = round50(Math.min(income * 0.2, afterFixed * 0.4));
+    const rest = afterFixed - saving;
+    const pool = rest * 0.95;
+    const wsum = sum(cats, (c) => weightOf(c.name)) || 1;
+    const alloc = {};
+    cats.forEach((c) => (alloc[c.id] = round50((pool * weightOf(c.name)) / wsum)));
+    return { saving, afterFixed, rest, alloc, buffer: rest - sum(Object.values(alloc), (x) => x) };
+  }
 
   // ---------- Durum ----------
   let state = load();
@@ -54,67 +95,181 @@
   }
   function freshState(name) {
     return {
-      version: 2, user: { name }, settings: { theme: 'auto', pinHash: null },
-      months: {}, savings: { holdings: [], goals: [] },
+      version: 3, user: { name }, settings: { theme: 'auto', pinHash: null },
+      plan: null, installments: [], months: {}, savings: { holdings: [], goals: [] },
       rates: null, rateOverrides: {}, ui: { month: monthKeyOf(), mode: 'gider', cat: null },
     };
   }
+  const isCommit = (c) => c.kind === 'fixed' || c.kind === 'taksit';
+  const catLabel = (c) => (c.kind === 'taksit' && c.count ? `${c.name} (${c.seq}/${c.count})` : c.name);
+  const instActive = (i, k) => k >= i.start && monthDiff(i.start, k) < i.count;
+
   function migrate(s) {
     s.ui = s.ui || {}; s.ui.month = s.ui.month || monthKeyOf(); s.ui.mode = s.ui.mode || 'gider';
     s.settings = s.settings || { theme: 'auto' };
     s.rateOverrides = s.rateOverrides || {};
     s.savings = s.savings || { holdings: [], goals: [] };
     s.months = s.months || {};
-    s.version = 2;
+    s.installments = s.installments || [];
+    for (const m of Object.values(s.months)) {
+      m.categories.forEach((c) => { c.kind = c.kind || (c.fixed ? 'fixed' : 'var'); c.subs = c.subs || []; delete c.fixed; });
+      m.saving = m.saving || { planned: 0, done: m.transferred || 0 };
+      delete m.transferred;
+    }
+    // v2 → v3: mevcut en son aydan bir plan türet
+    if (!s.plan) {
+      const keys = Object.keys(s.months).sort();
+      const base = keys.filter((k) => k <= monthKeyOf()).pop() || keys[keys.length - 1];
+      if (base) {
+        const bm = s.months[base];
+        s.plan = {
+          incomes: bm.incomes.map((i) => ({ id: uid(), name: i.name, amount: i.amount })),
+          fixed: bm.categories.filter((c) => c.kind === 'fixed').map((c) => ({ id: uid(), name: c.name, emoji: c.emoji, amount: c.planned })),
+          categories: bm.categories.filter((c) => c.kind === 'var').map((c) => ({ id: uid(), name: c.name, emoji: c.emoji, planned: c.planned, subs: clone(c.subs || []), toSavings: false })),
+          saving: 0, reviewed: false,
+        };
+        for (const k of keys.filter((k) => k >= base)) {
+          const m = s.months[k];
+          m.incomes.forEach((i) => { const t = s.plan.incomes.find((x) => lower(x.name) === lower(i.name)); if (t) i.tplId = t.id; });
+          m.categories.forEach((c) => { const t = [...s.plan.fixed, ...s.plan.categories].find((x) => lower(x.name) === lower(c.name)); if (t) c.tplId = t.id; });
+        }
+      }
+    }
+    s.version = 3;
     return s;
-  }
-
-  // --- Veri kodu (kişisel başlangıç verisi linkin # kısmında taşınır, sunucuya gitmez) ---
-  // Kompakt biçim: { m, i:[[ad,tutar]], c:[[ad,plan,sabit,emoji]], e:[[katIndex,açıklama,tutar,gün]], h:[[tür,adet,fiyat,tarih]], g:[[ad,emoji,hedef,tarih]] }
-  function decodeCode(text) {
-    const m = String(text || '').match(/(?:#veri=)?([A-Za-z0-9_-]{20,})\s*$/);
-    if (!m) return null;
-    try {
-      const b64 = m[1].replace(/-/g, '+').replace(/_/g, '/');
-      const bin = atob(b64 + '==='.slice((b64.length + 3) % 4));
-      const json = new TextDecoder().decode(Uint8Array.from(bin, (ch) => ch.charCodeAt(0)));
-      const d = JSON.parse(json);
-      return d && d.m && Array.isArray(d.c) ? d : null;
-    } catch { return null; }
-  }
-  function applyCode(d) {
-    const cats = d.c.map(([name, planned, fixed, emoji]) => ({ id: uid(), name, planned, fixed: !!fixed, emoji }));
-    state.months[d.m] = {
-      incomes: (d.i || []).map(([name, amount]) => ({ id: uid(), name, amount })),
-      categories: cats,
-      expenses: (d.e || []).map(([ci, desc, amount, day]) => ({ id: uid(), catId: cats[ci].id, desc, amount, date: `${d.m}-${pad(day)}`, extra: false })),
-      transferred: 0,
-    };
-    (d.h || []).forEach(([type, qty, buyPrice, date]) => state.savings.holdings.push({ id: uid(), type, qty, buyPrice, date, note: '' }));
-    (d.g || []).forEach(([name, emoji, target, deadline]) => state.savings.goals.push({ id: uid(), name, emoji, target, deadline, mode: 'all', manual: 0 }));
-    state.ui.month = d.m;
-  }
-  let pendingCode = null;
-  if (location.hash.startsWith('#veri=')) {
-    pendingCode = decodeCode(location.hash);
-    history.replaceState(null, '', location.pathname + '#/ozet');
   }
 
   const curMonthKey = () => state.ui.month || monthKeyOf();
   const getMonth = (key) => state.months[key];
   const monthKeys = () => Object.keys(state.months).sort();
 
-  // Ay yoksa, en yakın önceki aydan planı kopyalayarak oluştur (otomatik yeni ay)
-  function ensureMonth(key) {
-    if (state.months[key]) return state.months[key];
-    const prev = monthKeys().filter((k) => k < key).pop();
+  // ---------- Plan → ay senkronizasyonu ----------
+  // only: değişen öğe id'leri (Set) — null ise her şey plandaki değerlere eşitlenir.
+  function syncMonth(k, only) {
+    const m = state.months[k], p = state.plan;
+    if (!m || !p) return;
+    m.skip = m.skip || [];
+    const want = (id) => !only || only.has(id);
+    const hasEx = (c) => m.expenses.some((e) => e.catId === c.id);
+
+    p.incomes.forEach((t) => {
+      if (m.skip.includes(t.id)) return;
+      const x = m.incomes.find((i) => i.tplId === t.id) || m.incomes.find((i) => !i.tplId && lower(i.name) === lower(t.name));
+      if (!x) m.incomes.push({ id: uid(), tplId: t.id, name: t.name, amount: t.amount });
+      else { const fresh = !x.tplId; x.tplId = t.id; if (want(t.id) || fresh) { x.name = t.name; x.amount = t.amount; } }
+    });
+    m.incomes = m.incomes.filter((i) => !i.tplId || p.incomes.some((t) => t.id === i.tplId));
+
+    const upsert = (t, kind, fieldsFn) => {
+      if (m.skip.includes(t.id)) return;
+      let c = m.categories.find((x) => x.tplId === t.id) || m.categories.find((x) => !x.tplId && !x.instId && lower(x.name) === lower(t.name));
+      if (!c) { c = { id: uid(), tplId: t.id, kind, subs: [] }; m.categories.push(c); Object.assign(c, fieldsFn(c)); return; }
+      const fresh = !c.tplId; c.tplId = t.id; c.kind = kind;
+      if (want(t.id) || fresh) Object.assign(c, fieldsFn(c));
+    };
+    p.fixed.forEach((t) => upsert(t, 'fixed', () => ({ name: t.name, emoji: t.emoji, planned: t.amount, subs: [] })));
+    p.categories.forEach((t) => upsert(t, 'var', (c) => {
+      // plandaki alt başlıklar + bu ay harcaması olan eski alt başlıklar
+      const used = (c.subs || []).filter((s) => m.expenses.some((e) => e.subId === s.id) && !t.subs.some((x) => x.id === s.id));
+      return { name: t.name, emoji: t.emoji, planned: t.planned, toSavings: !!t.toSavings, subs: [...clone(t.subs), ...used] };
+    }));
+    const tplIds = new Set([...p.fixed, ...p.categories].map((t) => t.id));
+    m.categories = m.categories.filter((c) => {
+      if (c.tplId && !tplIds.has(c.tplId)) { if (hasEx(c)) { delete c.tplId; return true; } return false; }
+      return true;
+    });
+
+    state.installments.forEach((i) => {
+      const c = m.categories.find((x) => x.instId === i.id);
+      if (instActive(i, k)) {
+        const f = { kind: 'taksit', name: i.name, emoji: i.emoji || '🧾', planned: i.monthly, seq: monthDiff(i.start, k) + 1, count: i.count, subs: [] };
+        if (!c) m.categories.push({ id: uid(), instId: i.id, ...f });
+        else if (want(i.id)) Object.assign(c, f);
+      } else if (c && !hasEx(c)) m.categories = m.categories.filter((x) => x !== c);
+    });
+    m.categories = m.categories.filter((c) => !c.instId || state.installments.some((i) => i.id === c.instId) || hasEx(c));
+
+    m.saving = m.saving || { planned: 0, done: 0 };
+    if (want('saving')) m.saving.planned = p.saving || 0;
+  }
+  const syncFuture = (only) => monthKeys().filter((k) => k >= monthKeyOf()).forEach((k) => syncMonth(k, only));
+
+  function buildMonth(k) {
+    state.months[k] = { incomes: [], categories: [], expenses: [], saving: { planned: 0, done: 0 }, skip: [] };
+    if (state.plan) syncMonth(k, null);
+    return state.months[k];
+  }
+  function ensureMonth(k) {
+    if (state.months[k]) return state.months[k];
+    if (state.plan) return buildMonth(k);
+    const prev = monthKeys().filter((x) => x < k).pop();
     const src = prev && state.months[prev];
-    state.months[key] = {
+    state.months[k] = {
       incomes: src ? src.incomes.map((i) => ({ ...i, id: uid() })) : [],
       categories: src ? src.categories.map((c) => ({ ...c, id: uid() })) : [],
-      expenses: [], transferred: 0,
+      expenses: [], saving: { planned: src ? src.saving.planned : 0, done: 0 }, skip: [],
     };
-    return state.months[key];
+    return state.months[k];
+  }
+
+  // ---------- Veri kodu (kişisel başlangıç verisi; linkin # kısmında taşınır, sunucuya gitmez) ----------
+  function decodeCode(text) {
+    const mt = String(text || '').match(/(?:#veri=)?([A-Za-z0-9_-]{20,})\s*$/);
+    if (!mt) return null;
+    try {
+      const b64 = mt[1].replace(/-/g, '+').replace(/_/g, '/');
+      const bin = atob(b64 + '==='.slice((b64.length + 3) % 4));
+      const d = JSON.parse(new TextDecoder().decode(Uint8Array.from(bin, (ch) => ch.charCodeAt(0))));
+      return d && d.m && (Array.isArray(d.c) || d.v === 3) ? d : null;
+    } catch { return null; }
+  }
+  function addHoldingsGoals(d) {
+    (d.h || []).forEach(([type, qty, buyPrice, date]) => {
+      if (!state.savings.holdings.some((h) => h.type === type && h.qty === qty && h.buyPrice === buyPrice && h.date === date)) state.savings.holdings.push({ id: uid(), type, qty, buyPrice, date, note: '' });
+    });
+    (d.g || []).forEach(([name, emoji, target, deadline]) => {
+      if (!state.savings.goals.some((g) => lower(g.name) === lower(name))) state.savings.goals.push({ id: uid(), name, emoji, target, deadline, mode: 'all', manual: 0 });
+    });
+  }
+  function applyCode(d) {
+    if (d.v === 3) {
+      const p = d.p;
+      state.plan = {
+        incomes: p.i.map(([name, amount]) => ({ id: uid(), name, amount })),
+        fixed: p.f.map(([name, amount, emoji]) => ({ id: uid(), name, amount, emoji })),
+        categories: p.c.map(([name, emoji, planned, subs, toSav]) => ({ id: uid(), name, emoji, planned, subs: (subs || []).map((n) => ({ id: uid(), name: n })), toSavings: !!toSav })),
+        saving: p.s || 0, reviewed: false,
+      };
+      (d.t || []).forEach(([name, emoji, monthly, count, start]) => state.installments.push({ id: uid(), name, emoji, monthly, count, start }));
+      delete state.months[d.m];
+      const m = buildMonth(d.m);
+      (d.e || []).forEach(([cat, sub, desc, amount, day]) => {
+        const c = m.categories.find((x) => lower(x.name) === lower(cat));
+        if (!c) return;
+        const s = sub ? (c.subs || []).find((x) => lower(x.name) === lower(sub)) : null;
+        m.expenses.push({ id: uid(), catId: c.id, subId: s ? s.id : undefined, desc, amount, date: `${d.m}-${pad(day)}`, extra: false });
+      });
+      addHoldingsGoals(d);
+      syncFuture(null);
+      state.ui.month = d.m;
+      return;
+    }
+    // eski (v1) kod biçimi
+    const cats = d.c.map(([name, planned, fixed, emoji]) => ({ id: uid(), name, planned, kind: fixed ? 'fixed' : 'var', emoji, subs: [] }));
+    state.months[d.m] = {
+      incomes: (d.i || []).map(([name, amount]) => ({ id: uid(), name, amount })),
+      categories: cats,
+      expenses: (d.e || []).map(([ci, desc, amount, day]) => ({ id: uid(), catId: cats[ci].id, desc, amount, date: `${d.m}-${pad(day)}`, extra: false })),
+      saving: { planned: 0, done: 0 }, skip: [],
+    };
+    addHoldingsGoals(d);
+    if (!state.plan) { state = migrate(state); }
+    state.ui.month = d.m;
+  }
+  let pendingCode = null;
+  if (location.hash.startsWith('#veri=')) {
+    pendingCode = decodeCode(location.hash);
+    history.replaceState(null, '', location.pathname + '#/ozet');
   }
 
   // ---------- Hesaplar ----------
@@ -129,10 +284,12 @@
     if (planned === 0 && spent > 0) status = 'unplanned';
     else if (planned === 0) status = 'empty';
     else if (diff < 0) status = 'over';
-    else if (spent === 0) status = c.fixed ? 'pending' : 'untouched';
+    else if (spent === 0) status = isCommit(c) ? 'pending' : 'untouched';
     else status = 'ok';
+    const bySub = (c.subs || []).map((s) => ({ ...s, spent: sum(ex.filter((e) => e.subId === s.id), 'amount') }));
+    const noSub = sum(ex.filter((e) => !e.subId || !(c.subs || []).some((s) => s.id === e.subId)), 'amount');
     return {
-      ...c, planned, spent, diff, count: ex.length, status,
+      ...c, planned, spent, diff, count: ex.length, status, bySub, noSub,
       extra: planned > 0 ? extraFlagged : spent,
       inPlan: planned > 0 ? Math.min(nonExtra, planned) : 0,
       overrun: planned > 0 ? Math.max(0, nonExtra - planned) : 0,
@@ -141,22 +298,29 @@
   function calc(m, key) {
     const income = sum(m.incomes, 'amount');
     const cats = m.categories.map((c) => catStats(m, c));
-    const planned = sum(cats, 'planned');
+    const fixedCats = cats.filter((c) => c.kind === 'fixed'), instCats = cats.filter((c) => c.kind === 'taksit'), varCats = cats.filter((c) => c.kind === 'var');
+    const fixedPlan = sum(fixedCats, 'planned'), instPlan = sum(instCats, 'planned');
+    const committed = fixedPlan + instPlan;
+    const savingPlanned = (m.saving && m.saving.planned) || 0, savingDone = (m.saving && m.saving.done) || 0;
+    const kalan = income - committed - savingPlanned;
+    const allocated = sum(varCats, 'planned');
+    const unalloc = kalan - allocated;
+    const planned = committed + allocated;
     const spent = sum(m.expenses, 'amount');
     const now = monthKeyOf();
     const phase = key < now ? 'past' : key === now ? 'current' : 'future';
     const plannedCats = cats.filter((c) => c.planned > 0);
     const withinCount = plannedCats.filter((c) => c.spent <= c.planned).length;
-    // Ay kapanmadan değişken bütçede kalan para "kâr" değil, henüz harcanmamış alandır.
-    const closed = (c) => phase === 'past' || (c.fixed && c.spent > 0);
+    const closed = (c) => phase === 'past' || (isCommit(c) && c.spent > 0);
     const saved = sum(plannedCats.filter(closed), (c) => Math.max(0, c.diff));
     const openBudget = sum(plannedCats.filter((c) => !closed(c)), (c) => Math.max(0, c.diff));
     const lost = sum(cats, (c) => Math.max(0, -c.diff));
     const extra = sum(cats, 'extra');
     const inPlan = sum(cats, 'inPlan');
     const overrun = sum(cats, 'overrun');
-    const plannedSaving = income - planned;
-    const remaining = income - spent;
+    const plannedSaving = income - planned; // birikim + dağıtılmamış
+    const remaining = income - spent;       // birikime aktarılan dahil, elde kalan toplam
+    const cash = remaining - savingDone;     // birikime aktarılanlar düşülmüş nakit
     const vsPlan = planned - spent;
     const discipline = plannedCats.length ? withinCount / plannedCats.length : (spent <= planned ? 1 : 0);
     let savingPart;
@@ -166,10 +330,11 @@
     const extraPenalty = income > 0 ? clamp(extra / income, 0, 0.2) : 0;
     const score = Math.round(clamp((discipline * 0.5 + savingPart * 0.5 - extraPenalty) * 100, 0, 100));
     const savingRate = income > 0 ? (remaining / income) * 100 : 0;
-    const varLeft = sum(cats.filter((c) => !c.fixed && c.planned > 0), (c) => Math.max(0, c.diff));
-    const pendingFixed = sum(cats.filter((c) => c.fixed), (c) => Math.max(0, c.diff));
+    const varLeft = sum(varCats.filter((c) => c.planned > 0), (c) => Math.max(0, c.diff));
+    const pendingFixed = sum(cats.filter(isCommit), (c) => Math.max(0, c.diff));
     const daysLeft = phase === 'current' ? daysInMonth(key) - new Date().getDate() + 1 : 0;
-    return { income, planned, spent, cats, phase, saved, openBudget, lost, extra, inPlan, overrun, plannedSaving, remaining, vsPlan, score, savingRate, varLeft, pendingFixed, daysLeft, withinCount, plannedCount: plannedCats.length };
+    const toSavingsLeft = sum(varCats.filter((c) => c.toSavings), (c) => Math.max(0, c.diff));
+    return { income, cats, fixedCats, instCats, varCats, fixedPlan, instPlan, committed, savingPlanned, savingDone, kalan, allocated, unalloc, planned, spent, phase, saved, openBudget, lost, extra, inPlan, overrun, plannedSaving, remaining, cash, vsPlan, score, savingRate, varLeft, pendingFixed, daysLeft, withinCount, plannedCount: plannedCats.length, toSavingsLeft };
   }
   function scoreLabel(s) {
     if (s >= 85) return ['Mükemmel', 'good'];
@@ -178,37 +343,49 @@
     return ['Geliştirilmeli', 'bad'];
   }
 
-  // ---------- Kategori tahmini ----------
+  // ---------- Kategori / alt başlık tahmini ----------
   const KEYWORDS = [
-    [['bim', 'a101', 'şok', 'migros', 'carrefour', 'file', 'market', 'manav', 'kasap', 'getir', 'macro'], ['market']],
-    [['trendyol', 'hepsiburada', 'amazon', 'n11', 'temu', 'shein', 'aliexpress'], ['online', 'alışveriş']],
-    [['boston', 'zara', 'lcw', 'lc waikiki', 'koton', 'mavi', 'defacto', 'h&m', 'mango', 'bershka', 'pull', 'kıyafet', 'ayakkabı', 'flo'], ['kıyafet', 'giyim', 'kişisel']],
+    [['bim', 'a101', 'şok', 'migros', 'carrefour', 'file', 'market', 'manav', 'kasap', 'getir'], ['bim', 'market']],
+    [['gross', 'metro', 'makro', 'toptan'], ['gross', 'toptan', 'market']],
+    [['boston', 'zara', 'lcw', 'lc waikiki', 'koton', 'mavi', 'defacto', 'h&m', 'mango', 'bershka', 'pull', 'kıyafet', 'ayakkabı', 'flo', 'giyim'], ['kıyafet', 'giyim', 'ihtiyaç', 'kişisel', 'kendime']],
+    [['gratis', 'watsons', 'rossmann', 'sephora', 'kozmetik', 'parfüm', 'flormar'], ['kozmetik', 'bakım', 'ihtiyaç']],
+    [['ikea', 'koçtaş', 'masa', 'mobilya', 'english home', 'madame coco', 'deterjan', 'temizlik'], ['ev ihtiyaç', 'ev', 'ihtiyaç']],
+    [['trendyol', 'hepsiburada', 'amazon', 'n11', 'temu', 'shein', 'aliexpress'], ['istediğim', 'online', 'alışveriş', 'ihtiyaç']],
     [['tatlı', 'kafe', 'cafe', 'starbucks', 'kahve', 'restoran', 'yemek', 'burger', 'pizza', 'döner', 'yemeksepeti', 'lokanta', 'simit'], ['dışarı', 'kafe', 'yeme', 'yemek']],
-    [['gratis', 'watsons', 'rossmann', 'sephora', 'kozmetik', 'parfüm', 'eveline', 'flormar'], ['kozmetik', 'bakım']],
-    [['netflix'], ['netflix', 'abonelik']], [['spotify', 'youtube', 'disney', 'exxen', 'blutv', 'icloud', 'apple'], ['abonelik', 'dijital']],
-    [['fatura', 'turkcell', 'vodafone', 'türk telekom', 'elektrik', 'doğalgaz', 'su faturası', 'internet'], ['fatura', 'telefon']],
-    [['benzin', 'akaryakıt', 'shell', 'opet', 'bp', 'taksi', 'uber', 'bitaksi', 'metro', 'otobüs', 'istanbulkart', 'marmaray'], ['ulaşım', 'yol', 'araba']],
-    [['ikea', 'koçtaş', 'masa', 'mobilya', 'english home', 'madame coco'], ['masa', 'ev']],
+    [['otel', 'uçak', 'pegasus', 'thy', 'bilet', 'sinema', 'konser', 'tatil', 'müze'], ['gezme', 'eğlence', 'tatil']],
+    [['benzin', 'akaryakıt', 'shell', 'opet', 'taksi', 'uber', 'bitaksi', 'metro kart', 'otobüs', 'istanbulkart', 'marmaray', 'dolmuş'], ['yol', 'ulaşım', 'araba']],
+    [['kardeş', 'anne', 'baba', 'bağış', 'yardım'], ['kardeş', 'aile', 'yardım']],
     [['eczane', 'doktor', 'hastane', 'ilaç'], ['sağlık']],
-    [['spor', 'gym', 'salon', 'fitness'], ['spor']],
+    [['netflix', 'spotify', 'youtube', 'disney', 'icloud'], ['netflix', 'spotify', 'abonelik']],
+    [['fatura', 'turkcell', 'vodafone', 'türk telekom', 'elektrik', 'doğalgaz', 'internet'], ['fatura', 'telefon', 'internet', 'elektrik']],
   ];
+  const stripSeq = (s) => lower(s).replace(/\s*\(\d+\/\d+\)$/, '');
   function guessCategory(desc, month) {
     const d = lower(desc);
     if (!d) return null;
     for (const k of monthKeys().reverse()) {
       const mm = state.months[k];
-      const hit = [...mm.expenses].reverse().find((e) => lower(e.desc).replace(/\s*\(\d+\/\d+\)$/, '') === d);
-      if (hit) {
-        const cat = mm.categories.find((c) => c.id === hit.catId);
-        const same = cat && month.categories.find((c) => lower(c.name) === lower(cat.name));
-        if (same) return same.id;
+      const hit = [...mm.expenses].reverse().find((e) => stripSeq(e.desc) === d);
+      if (!hit) continue;
+      const cat = mm.categories.find((c) => c.id === hit.catId);
+      const same = cat && month.categories.find((c) => lower(c.name) === lower(cat.name));
+      if (same) {
+        const sname = hit.subId && (cat.subs || []).find((s) => s.id === hit.subId)?.name;
+        const sub = sname && (same.subs || []).find((s) => lower(s.name) === lower(sname));
+        return { cat: same.id, sub: sub ? sub.id : null };
       }
     }
-    const direct = month.categories.find((c) => lower(c.name) === d || (d.length >= 3 && lower(c.name).startsWith(d)));
-    if (direct) return direct.id;
+    for (const c of month.categories) {
+      if (lower(c.name) === d || (d.length >= 3 && lower(c.name).startsWith(d))) return { cat: c.id, sub: null };
+      const s = (c.subs || []).find((x) => d.length >= 3 && lower(x.name).includes(d));
+      if (s) return { cat: c.id, sub: s.id };
+    }
     for (const [words, hints] of KEYWORDS) {
-      if (words.some((w) => d.includes(w))) {
-        for (const h of hints) { const cat = month.categories.find((c) => lower(c.name).includes(h)); if (cat) return cat.id; }
+      if (!words.some((w) => d.includes(w))) continue;
+      for (const h of hints) {
+        for (const c of month.categories) { const s = (c.subs || []).find((x) => lower(x.name).includes(h)); if (s) return { cat: c.id, sub: s.id }; }
+        const c = month.categories.find((x) => lower(x.name).includes(h));
+        if (c) return { cat: c.id, sub: null };
       }
     }
     return null;
@@ -249,7 +426,6 @@
     TAMALTIN: 'TEK_YENI', TAM_ESKI: 'TEK_ESKI', ATAALTIN: 'ATA_YENI', ATA_ESKI: 'ATA_ESKI', ATA5: 'ATA5_YENI', GREMSE: 'GREMESE_YENI',
     GUMUS: 'GUMUSTRY', USD: 'USDTRY', EUR: 'EURTRY', GBP: 'GBPTRY',
   };
-
   function haremSnapshot(ms = 8000) {
     return new Promise((resolve, reject) => {
       let ws;
@@ -306,14 +482,14 @@
     ratesLoading = true;
     if (route() === 'birikim' && !silent) renderView();
     const tries = [
-      async () => { const p = await haremSnapshot(); return { data: normalizeHarem(p), source: 'Harem Altın', date: new Date(p.meta.time).toLocaleString('tr-TR') }; },
-      async () => { const d = await getJSON('https://finans.truncgil.com/v4/today.json'); return { data: normalizeTruncgil(d), source: 'Truncgil (Kapalıçarşı)', date: d.Update_Date }; },
-      async () => { const d = await getJSON('api/rates'); return { data: normalizeTruncgil(d), source: 'Truncgil (yerel sunucu)', date: d.Update_Date }; },
+      async () => { const p = await haremSnapshot(); return { data: normalizeHarem(p), source: 'Harem Altın' }; },
+      async () => { const d = await getJSON('https://finans.truncgil.com/v4/today.json'); return { data: normalizeTruncgil(d), source: 'Truncgil (Kapalıçarşı)' }; },
+      async () => { const d = await getJSON('api/rates'); return { data: normalizeTruncgil(d), source: 'Truncgil (yerel sunucu)' }; },
       async () => {
         const [g, fx] = await Promise.all([getJSON('https://api.gold-api.com/price/XAU'), getJSON('https://api.frankfurter.dev/v1/latest?base=USD&symbols=TRY,EUR,GBP')]);
         const usd = fx.rates.TRY, gram = (g.price * usd) / 31.1035;
         const mk = (v) => ({ buy: v, sell: v * 1.02, change: 0 });
-        return { source: 'Tahmini (ons × dolar)', date: fx.date, data: {
+        return { source: 'Tahmini (ons × dolar)', data: {
           USD: mk(usd), EUR: mk(usd / fx.rates.EUR), GBP: mk(usd / fx.rates.GBP), HAS: mk(gram * 0.995), GRA: mk(gram),
           '22AYAR': mk(gram * 0.916), '18AYARALTIN': mk(gram * 0.73), '14AYARALTIN': mk(gram * 0.57),
           CEYREKALTIN: mk(gram * 1.6), YARIMALTIN: mk(gram * 3.2), TAMALTIN: mk(gram * 6.4), ATAALTIN: mk(gram * 6.62),
@@ -325,19 +501,19 @@
       try { const r = await t(); if (r && r.data && r.data.GRA) { got = r; break; } } catch { /* sonraki kaynak */ }
     }
     ratesLoading = false;
-    if (got) { state.rates = { ts: Date.now(), source: got.source, date: got.date, data: got.data }; save(); if (force && !silent) toast(`Kurlar güncellendi · ${got.source}`); }
+    if (got) { state.rates = { ts: Date.now(), source: got.source, data: got.data }; save(); if (force && !silent) toast(`Kurlar güncellendi · ${got.source}`); }
     else if (force && !silent) toast('Kurlar alınamadı — internet bağlantını kontrol et');
     if (route() === 'birikim' && $('#sheet').hidden && !$('#app').hidden) renderView();
   }
+  const rateOf = (type) => { const a = ASSETS[type]; const d = state.rates && state.rates.data; return a && a.key && d ? d[a.key] || (a.alt && d[a.alt]) : null; };
   function unitPrice(type) {
     const a = ASSETS[type];
     if (!a) return null;
     if (!a.key) return 1;
     const o = state.rateOverrides[a.key];
     if (o) return o;
-    const d = state.rates && state.rates.data;
-    const r = d && (d[a.key] || (a.alt && d[a.alt]));
-    return r ? r.buy : null; // bozdurma (alış) fiyatı
+    const r = rateOf(type);
+    return r ? r.buy : null;
   }
   function portfolio() {
     const rows = state.savings.holdings.map((h) => {
@@ -359,6 +535,7 @@
   function openSheet(title, html, onMount) {
     $('#sheet-title').textContent = title;
     $('#sheet-body').innerHTML = html;
+    $('#sheet-body').scrollTop = 0;
     $('#sheet').hidden = false; $('#sheet-backdrop').hidden = false;
     document.body.style.overflow = 'hidden';
     onMount && onMount($('#sheet-body'));
@@ -400,7 +577,7 @@
       case 'untouched': return phase === 'past' ? `<span class="chip good">✓ Tasarruf ${money(c.diff)}</span>` : `<span class="chip info">Kalan ${money(c.diff)}</span>`;
       case 'ok':
         if (c.diff === 0) return `<span class="chip good">✓ Tam plan</span>`;
-        return phase === 'past' || c.fixed ? `<span class="chip good">✓ Tasarruf ${money(c.diff)}</span>` : `<span class="chip info">Kalan ${money(c.diff)}</span>`;
+        return phase === 'past' || isCommit(c) ? `<span class="chip good">✓ Tasarruf ${money(c.diff)}</span>` : `<span class="chip info">Kalan ${money(c.diff)}</span>`;
       default: return '';
     }
   }
@@ -418,26 +595,22 @@
     const cls = c.status === 'over' || c.status === 'unplanned' ? 'over' : c.status === 'ok' && c.diff === 0 ? 'good' : '';
     return `<div class="bar"><i class="${cls}" style="width:${p}%"></i></div>`;
   }
+  const subLine = (c) => {
+    const parts = c.bySub.filter((s) => s.spent > 0).map((s) => `${esc(s.name)} ${money(s.spent)}`);
+    if (c.noSub > 0 && c.bySub.length) parts.push(`Diğer ${money(c.noSub)}`);
+    return parts.length ? `<div class="subline">${parts.join(' · ')}</div>` : c.subs && c.subs.length ? `<div class="subline">${c.subs.map((s) => `<span class="pill-sub">${esc(s.name)}</span>`).join('')}</div>` : '';
+  };
   function emptyMonth(key) {
-    const prev = monthKeys().filter((k) => k < key).pop() || monthKeys().filter((k) => k > key)[0];
-    return `<div class="card empty">
-      <div class="big">🗓️</div>
-      <h3>${monthName(key)} için plan yok</h3>
-      <p class="small">Gelirini, sabit giderlerini ve kategori bütçelerini ekleyerek başla.</p>
-      ${prev ? `<button class="btn" data-act="copy-month" data-from="${prev}">${monthName(prev)} planını kopyala</button><div style="height:8px"></div>` : ''}
-      <button class="btn secondary" data-act="blank-month">Boş plan oluştur</button>
-      ${prev ? `<p class="hint">Kopyalama gelirleri, sabit giderleri ve kategori limitlerini aktarır; harcamaları aktarmaz.</p>` : ''}
-    </div>`;
+    if (!state.plan) return `<div class="card empty"><div class="big">🧭</div><h3>Önce planını oluşturalım</h3>
+      <p class="small">Gelirini, düzenli ödemelerini, birikimini ve harcama kategorilerini birkaç adımda belirle. Plan her ay otomatik kullanılır.</p>
+      <button class="btn" data-act="wizard">Planımı oluştur</button></div>`;
+    return `<div class="card empty"><div class="big">🗓️</div><h3>${monthName(key)} henüz açılmadı</h3>
+      <p class="small">Planın bu aya uygulanır; sonra istediğini bu ay için değiştirebilirsin.</p>
+      <button class="btn" data-act="build">Planımı ${monthName(key)} ayına uygula</button></div>`;
   }
   function bindEmptyMonth(key) {
-    const b1 = $('[data-act="copy-month"]', view);
-    if (b1) b1.onclick = () => {
-      const src = state.months[b1.dataset.from];
-      state.months[key] = { incomes: src.incomes.map((i) => ({ ...i, id: uid() })), categories: src.categories.map((c) => ({ ...c, id: uid() })), expenses: [], transferred: 0 };
-      save(); toast('Plan kopyalandı'); renderView();
-    };
-    const b2 = $('[data-act="blank-month"]', view);
-    if (b2) b2.onclick = () => { state.months[key] = { incomes: [], categories: [], expenses: [], transferred: 0 }; save(); renderView(); };
+    const w = $('[data-act="wizard"]', view); if (w) w.onclick = () => openWizard(state.plan ? 'edit' : 'first');
+    const b = $('[data-act="build"]', view); if (b) b.onclick = () => { buildMonth(key); save(); toast('Plan uygulandı'); renderView(); };
   }
   function warnAfterSave(month, catId) {
     const c = month.categories.find((x) => x.id === catId);
@@ -448,51 +621,71 @@
     if (st.spent / st.planned >= 0.8) return `⚠︎ ${c.name}: bütçenin %${Math.round((st.spent / st.planned) * 100)}'i doldu · ${money(st.diff)} kaldı`;
     return `${c.name}: ${money(st.diff)} kaldı`;
   }
+  const subSelect = (cat, selId) => cat && cat.subs && cat.subs.length
+    ? `<option value="">— Alt başlık yok —</option>${cat.subs.map((s) => `<option value="${s.id}" ${s.id === selId ? 'selected' : ''}>${esc(s.name)}</option>`).join('')}` : '';
 
-  // ---------- Sayfa: Özet (ana sayfa) ----------
+  // ---------- Sayfa: Özet ----------
   function renderOzet() {
     const key = curMonthKey(), m = getMonth(key);
     if (!m) { view.innerHTML = emptyMonth(key); bindEmptyMonth(key); return; }
     const s = calc(m, key);
-    const usedPct = s.income ? clamp((s.spent / s.income) * 100, 0, 100) : 0;
+    const usedPct = s.income ? clamp(((s.spent + s.savingDone) / s.income) * 100, 0, 100) : 0;
     const [lbl, lcls] = scoreLabel(s.score);
-    const phaseNote = s.phase === 'current' ? 'Ay devam ediyor' : s.phase === 'future' ? 'Gelecek ay' : 'Ay kapandı';
     const daily = s.daysLeft > 0 ? s.varLeft / s.daysLeft : 0;
-    const fixed = s.cats.filter((c) => c.fixed);
+    const commits = [...s.fixedCats, ...s.instCats];
     const order = { over: 0, unplanned: 1, ok: 2, untouched: 3, empty: 4, pending: 5 };
-    const vari = s.cats.filter((c) => !c.fixed).sort((a, b) => order[a.status] - order[b.status] || b.spent - a.spent);
-    const unalloc = s.income - s.planned;
-    const canTransfer = s.remaining > 0 && !(m.transferred > 0) && s.phase !== 'future';
+    const vari = [...s.varCats].sort((a, b) => order[a.status] - order[b.status] || b.spent - a.spent);
+    const savLeft = Math.max(0, s.savingPlanned - s.savingDone);
+    const savPct = s.savingPlanned > 0 ? clamp((s.savingDone / s.savingPlanned) * 100, 0, 100) : 0;
 
     view.innerHTML = `
+      ${state.plan && !state.plan.reviewed ? `<div class="banner"><div class="t"><b>Planını gözden geçir</b><br>Birikim ve kategori tutarlarını kendine göre ayarla.</div><button class="btn small" id="review">Planım</button></div>` : ''}
+
       <div class="card hero">
-        <div class="hero-label">${s.phase === 'past' ? 'Ay sonunda kalan' : 'Toplam bütçeden kalan'}</div>
-        <div class="hero-num ${s.remaining < 0 ? 'bad' : ''}">${money(s.remaining)}</div>
-        <div class="hero-sub">Gelir ${money(s.income)} · Harcanan ${money(s.spent)}</div>
+        <div class="hero-label">${s.phase === 'past' ? 'Ay sonunda elinde kalan' : 'Elinde kalan'}</div>
+        <div class="hero-num ${s.cash < 0 ? 'bad' : ''}">${money(s.cash)}</div>
+        <div class="hero-sub">Gelir ${money(s.income)} · Harcanan ${money(s.spent)}${s.savingDone ? ` · Birikime ${money(s.savingDone)}` : ''}</div>
         <div class="bar thick" style="margin-top:12px"><i class="${s.spent > s.income ? 'over' : ''}" style="width:${usedPct}%"></i></div>
         <div class="stats">
-          <div class="stat"><div class="k">Planlanan gider</div><div class="v">${money(s.planned)}</div></div>
-          <div class="stat"><div class="k">Serbest cep (plansız)</div><div class="v ${s.plannedSaving < 0 ? 'bad' : ''}">${money(s.plannedSaving)}</div></div>
-          <div class="stat"><div class="k">${s.phase === 'past' ? 'Plana göre' : 'Bütçede kalan'}</div><div class="v ${s.vsPlan < 0 ? 'bad' : 'good'}">${s.phase === 'past' ? signed(s.vsPlan) : money(s.vsPlan)}</div></div>
+          <div class="stat"><div class="k">Bütçede kalan</div><div class="v ${s.vsPlan < 0 ? 'bad' : 'good'}">${money(s.vsPlan)}</div></div>
           <div class="stat"><div class="k">${s.phase === 'current' ? 'Günlük harcama hakkın' : 'Tasarruf oranı'}</div><div class="v">${s.phase === 'current' ? money(daily) : pct(s.savingRate)}</div></div>
         </div>
-        ${unalloc < 0 ? `<p class="small bad" style="margin:10px 0 0">⚠︎ Planın gelirini ${money(-unalloc)} aşıyor.</p>` : ''}
+      </div>
+
+      <div class="card">
+        <div class="card-head"><h3>🧭 Bu ayın planı</h3><button class="link-btn" id="edit-plan">Planımı düzenle</button></div>
+        <ul class="wf">
+          <li><span class="k">Toplam gelir</span><span class="v">${money(s.income)}</span></li>
+          <li class="minus"><span class="k">− Sabit giderler</span><span class="v">${money(s.fixedPlan)}</span></li>
+          ${s.instPlan ? `<li class="minus"><span class="k">− Taksitler</span><span class="v">${money(s.instPlan)}</span></li>` : ''}
+          <li class="minus"><span class="k">− Planlanan birikim</span><span class="v">${money(s.savingPlanned)}</span></li>
+          <li class="total"><span class="k">= Kalan</span><span class="v ${s.kalan < 0 ? 'bad' : ''}">${money(s.kalan)}</span></li>
+          <li class="sub minus"><span class="k">Kategorilere ayrılan</span><span class="v">${money(s.allocated)}</span></li>
+          <li class="sub"><span class="k">${s.unalloc < 0 ? '<span class="bad">Fazla dağıtılan</span>' : 'Dağıtılmamış (serbest)'}</span><span class="v ${s.unalloc < 0 ? 'bad' : 'good'}">${money(Math.abs(s.unalloc))}</span></li>
+        </ul>
       </div>
 
       <div class="card">
         <div class="card-head"><h3>💰 Gelirlerim</h3><button class="btn small" id="add-inc">+ Gelir</button></div>
-        <ul class="list">${m.incomes.map((i) => `<li class="tap" data-inc="${i.id}"><div class="main"><div class="title">${esc(i.name)}</div>${i.note ? `<div class="sub">${esc(i.note)}</div>` : ''}</div><div class="amt good">+${money(i.amount)}</div></li>`).join('') || '<li class="muted small">Maaş, ek iş, burs gibi gelirlerini ekle.</li>'}</ul>
+        <ul class="list">${m.incomes.map((i) => `<li class="tap" data-inc="${i.id}"><div class="main"><div class="title">${esc(i.name)}</div><div class="sub">${i.tplId ? 'Her ay' : 'Sadece bu ay'}${i.note ? ' · ' + esc(i.note) : ''}</div></div><div class="amt good">+${money(i.amount)}</div></li>`).join('') || '<li class="muted small">Bu ay gelir yok. Maaş, ek iş, prim… ekle.</li>'}</ul>
         ${m.incomes.length > 1 ? `<div class="card-foot"><span class="muted small">Toplam gelir</span><b>${money(s.income)}</b></div>` : ''}
       </div>
 
       <div class="card">
-        <div class="card-head"><h3>📌 Sabit giderlerim</h3><button class="btn small secondary" id="add-fixed">+ Ekle</button></div>
-        <ul class="list">${fixed.map((c) => `<li>
-          <div class="main tap" data-editcat="${c.id}"><div class="title">${esc(c.emoji || '•')} ${esc(c.name)}</div>
-            <div class="sub">${c.spent > 0 ? `Ödenen ${money(c.spent)}${c.diff !== 0 ? ` · ${c.diff > 0 ? 'plandan ' + money(c.diff) + ' az' : '<span class="bad">' + money(-c.diff) + ' fazla</span>'}` : ''}` : 'Henüz ödenmedi'}</div></div>
+        <div class="card-head"><h3>📌 Sabit giderler ve taksitler</h3><a class="link-btn" href="#/odemeler">Tümü →</a></div>
+        <ul class="list">${commits.map((c) => `<li>
+          <div class="main"><div class="title">${esc(c.emoji || '•')} ${esc(catLabel(c))}</div>
+            <div class="sub">${c.kind === 'taksit' ? 'Taksit · ' : ''}${c.spent > 0 ? `Ödenen ${money(c.spent)}${c.diff !== 0 ? ` · ${c.diff > 0 ? 'plandan ' + money(c.diff) + ' az' : '<span class="bad">' + money(-c.diff) + ' fazla</span>'}` : ''}` : 'Henüz ödenmedi'}</div></div>
           <div class="right"><div class="amt">${money(c.planned)}</div>
-            ${c.spent > 0 ? '<span class="chip good">✓ Ödendi</span>' : `<button class="btn small" data-pay="${c.id}">Öde</button>`}</div></li>`).join('') || '<li class="muted small">Kredi kartı, fatura, kira, abonelik gibi her ay ödediklerin.</li>'}</ul>
-        ${fixed.length ? `<div class="card-foot"><span class="muted small">Ödenen ${money(sum(fixed, 'spent'))} / ${money(sum(fixed, 'planned'))}</span><b class="${s.pendingFixed > 0 ? '' : 'good'}">${s.pendingFixed > 0 ? 'Kalan ' + money(s.pendingFixed) : 'Hepsi ödendi'}</b></div>` : ''}
+            ${c.spent > 0 ? '<span class="chip good">✓ Ödendi</span>' : `<button class="btn small" data-pay="${c.id}">Öde</button>`}</div></li>`).join('') || '<li class="muted small">Sabit gider veya taksit yok. <a href="#/odemeler">Ödemeler</a> sayfasından ekle.</li>'}</ul>
+        ${commits.length ? `<div class="card-foot"><span class="muted small">Ödenen ${money(sum(commits, 'spent'))} / ${money(s.committed)}</span><b class="${s.pendingFixed > 0 ? '' : 'good'}">${s.pendingFixed > 0 ? 'Kalan ' + money(s.pendingFixed) : 'Hepsi ödendi'}</b></div>` : ''}
+      </div>
+
+      <div class="card">
+        <div class="card-head"><h3>🏦 Birikim</h3><span class="muted small">Planlanan ${money(s.savingPlanned)}</span></div>
+        <div class="bar thick"><i class="good" style="width:${savPct}%"></i></div>
+        <div class="cat-bottom"><span>Aktarılan ${money(s.savingDone)}</span><span class="muted">${savLeft > 0 ? 'Kalan ' + money(savLeft) : s.savingPlanned > 0 ? '✓ Tamamlandı' : ''}</span></div>
+        <div class="btn-row"><button class="btn ${savLeft > 0 ? '' : 'secondary'}" id="btn-save">${savLeft > 0 ? `${money(savLeft)} birikime aktar` : 'Birikime para aktar'}</button></div>
       </div>
 
       <div class="card">
@@ -503,56 +696,50 @@
               <div class="cat-amt">${money(c.spent)} / ${money(c.planned)} <button class="mini-btn" data-editcat="${c.id}" aria-label="${esc(c.name)} düzenle">✎</button></div>
             </div>
             <div class="tap" data-go="${c.id}">${catBar(c)}</div>
-            <div class="cat-bottom"><span>${statusChip(c, s.phase)}</span><span class="muted">${c.count} işlem</span></div>
-          </div>`).join('') : `<div class="empty small">Kıyafet, market, kafe gibi limit koyacağın kategorileri ekle.</div>`}
-        <p class="hint">Bir kategoriye dokununca İşlem sayfasında detayını ve bu ayki harcamalarını görürsün. ✎ ile tutarı değiştir veya sil.</p>
+            ${subLine(c)}
+            <div class="cat-bottom"><span>${statusChip(c, s.phase)}${c.toSavings && c.diff > 0 ? ' <span class="chip neutral">artanı birikime</span>' : ''}</span><span class="muted">${c.count} işlem</span></div>
+          </div>`).join('') : `<div class="empty small">Henüz kategori yok. İhtiyaçlarım, market, yol gibi kategoriler ekle.</div>`}
+        <p class="hint">Kategoriye dokun → Giriş/Çıkış sayfasında detayı ve bu ayki harcamaları. ✎ → tutar, alt başlıklar, silme.</p>
       </div>
 
       <div class="card">
-        <div class="card-head"><h3>Ay sonu analizi</h3><span class="muted tiny">${phaseNote}</span></div>
+        <div class="card-head"><h3>Ay sonu analizi</h3><span class="muted tiny">${s.phase === 'current' ? 'Ay devam ediyor' : s.phase === 'future' ? 'Gelecek ay' : 'Ay kapandı'}</span></div>
         <div class="score">
           ${ring(s.score)}
           <div>
             <div style="font-weight:700;font-size:17px" class="${lcls}">${lbl}</div>
-            <div class="small muted">${s.withinCount}/${s.plannedCount} kategori bütçe içinde.<br>${s.phase === 'past'
+            <div class="small muted">${s.withinCount}/${s.plannedCount} kalem bütçe içinde.<br>${s.phase === 'past'
               ? (s.vsPlan >= 0 ? `Plana göre <b class="good">${money(s.vsPlan)} kârla</b> kapattın.` : `Plana göre <b class="bad">${money(-s.vsPlan)} zararla</b> kapattın.`)
               : (s.lost > 0 ? `Şu ana kadar <b class="bad">${money(s.lost)} aşım</b> var.` : `Şu ana kadar <b class="good">aşım yok</b>.`)}</div>
           </div>
         </div>
         <ul class="list" style="margin-top:12px">
           <li><div class="main"><div class="title">Plan içi harcama</div><div class="sub">Bütçe limitleri içinde kalan kısım</div></div><div class="amt">${money(s.inPlan)}</div></li>
-          <li><div class="main"><div class="title">Bütçe aşımı</div><div class="sub">Planlı kategorilerde limiti geçen</div></div><div class="amt ${s.overrun ? 'bad' : ''}">${money(s.overrun)}</div></li>
+          <li><div class="main"><div class="title">Bütçe aşımı</div><div class="sub">Limiti geçen kısım</div></div><div class="amt ${s.overrun ? 'bad' : ''}">${money(s.overrun)}</div></li>
           <li><div class="main"><div class="title">Ekstra (plan dışı)</div><div class="sub">Planda olmayan / ekstra işaretli</div></div><div class="amt ${s.extra ? 'warn' : ''}">${money(s.extra)}</div></li>
-          <li><div class="main"><div class="title">Kâr edilen (tasarruf)</div><div class="sub">${s.phase === 'past' ? 'Limitin altında kalan kategoriler' : 'Ödenmiş sabitlerde plandan artan'}</div></div><div class="amt good">+${money(s.saved)}</div></li>
+          <li><div class="main"><div class="title">Kâr edilen (tasarruf)</div><div class="sub">${s.phase === 'past' ? 'Limitin altında kalanlar' : 'Ödenmiş sabitlerde plandan artan'}</div></div><div class="amt good">+${money(s.saved)}</div></li>
           ${s.phase !== 'past' ? `<li><div class="main"><div class="title">Henüz harcanmamış bütçe</div><div class="sub">Ay sonunda harcanmazsa kâra döner</div></div><div class="amt">${money(s.openBudget)}</div></li>` : ''}
-          <li><div class="main"><div class="title">Zarar edilen</div><div class="sub">Limiti aşan + plansız kategoriler</div></div><div class="amt ${s.lost ? 'bad' : ''}">${s.lost ? '−' + money(s.lost) : money(0)}</div></li>
-          <li><div class="main"><div class="title">Totalde sana kalan</div><div class="sub">Gelir − tüm harcamalar</div></div><div class="amt ${s.remaining < 0 ? 'bad' : ''}" style="font-size:17px">${money(s.remaining)}</div></li>
+          <li><div class="main"><div class="title">Zarar edilen</div><div class="sub">Limiti aşan + plansız</div></div><div class="amt ${s.lost ? 'bad' : ''}">${s.lost ? '−' + money(s.lost) : money(0)}</div></li>
+          <li><div class="main"><div class="title">Birikime aktarılan</div></div><div class="amt good">${money(s.savingDone)}</div></li>
+          <li><div class="main"><div class="title">Totalde sana kalan</div><div class="sub">Gelir − harcamalar − birikime aktarılan</div></div><div class="amt ${s.cash < 0 ? 'bad' : ''}" style="font-size:17px">${money(s.cash)}</div></li>
         </ul>
-        ${canTransfer ? `<button class="btn secondary" style="margin-top:10px" id="btn-transfer">Kalanı (${money(s.remaining)}) birikime aktar</button>` : ''}
-        ${m.transferred > 0 ? `<p class="hint">✓ Bu aydan ${money(m.transferred)} birikime aktarıldı.</p>` : ''}
+        ${s.cash > 0 && s.phase !== 'future' ? `<button class="btn secondary" style="margin-top:10px" id="btn-rest">Kalanı (${money(s.cash)}) birikime aktar</button>` : ''}
       </div>`;
 
+    const rv = $('#review'); if (rv) rv.onclick = () => openWizard('edit');
+    $('#edit-plan').onclick = () => openWizard(state.plan ? 'edit' : 'first');
     $('#add-inc').onclick = () => incomeForm(m);
     $$('[data-inc]', view).forEach((li) => (li.onclick = () => incomeForm(m, m.incomes.find((i) => i.id === li.dataset.inc))));
-    $('#add-fixed').onclick = () => categoryForm(m, null, true);
-    $('#add-cat').onclick = () => categoryForm(m, null, false);
+    $('#add-cat').onclick = () => categoryForm(m, null);
     $$('[data-editcat]', view).forEach((b) => (b.onclick = (ev) => { ev.stopPropagation(); categoryForm(m, m.categories.find((c) => c.id === b.dataset.editcat)); }));
     $$('[data-go]', view).forEach((b) => (b.onclick = () => { state.ui.cat = b.dataset.go; state.ui.mode = 'gider'; location.hash = '#/islem'; }));
-    $$('[data-pay]', view).forEach((b) => (b.onclick = () => {
-      const c = m.categories.find((x) => x.id === b.dataset.pay);
-      payFixed(m, key, c);
-    }));
-    const bt = $('#btn-transfer');
-    if (bt) bt.onclick = () => {
-      if (!confirm(`${money(s.remaining)} Türk Lirası olarak birikimine eklensin mi?`)) return;
-      state.savings.holdings.push({ id: uid(), type: 'TRY', qty: Math.round(s.remaining), buyPrice: 1, date: todayISO(), note: `${monthName(key)} artanı` });
-      m.transferred = Math.round(s.remaining);
-      save(); toast('Birikime aktarıldı'); renderView();
-    };
+    $$('[data-pay]', view).forEach((b) => (b.onclick = () => payFixed(m, key, m.categories.find((x) => x.id === b.dataset.pay))));
+    $('#btn-save').onclick = () => transferForm(m, key, savLeft || '');
+    const br = $('#btn-rest'); if (br) br.onclick = () => transferForm(m, key, Math.round(s.cash));
   }
 
   function payFixed(m, key, c) {
-    openSheet(`${c.name} — öde`, `
+    openSheet(`${catLabel(c)} — öde`, `
       <form id="f">
         <div class="field"><label>Ödenen tutar</label><input class="input big" name="amount" inputmode="decimal" value="${amtStr(c.planned)}"></div>
         <div class="field"><label>Tarih</label><input class="input" type="date" name="date" value="${monthKeyOf() === key ? todayISO() : key + '-01'}"></div>
@@ -564,40 +751,70 @@
         ev.preventDefault();
         const amount = parseAmount(f.amount.value);
         if (!(amount > 0)) return toast('Geçerli bir tutar gir');
-        m.expenses.push({ id: uid(), catId: c.id, desc: c.name, amount, date: f.date.value, extra: false });
+        m.expenses.push({ id: uid(), catId: c.id, desc: catLabel(c), amount, date: f.date.value, extra: false });
         save(); closeSheet(); toast(`${c.name} ödendi`); renderView();
       };
     });
   }
 
-  // ---------- Sayfa: İşlem (giriş / çıkış) ----------
+  function transferForm(m, key, amount) {
+    const types = ['TRY', 'GRAM', 'CEYREK', 'USD', 'EUR', 'GUMUS'];
+    openSheet('Birikime aktar', `
+      <form id="f">
+        <div class="field"><label>Tutar</label><input class="input big" name="amount" inputmode="decimal" value="${amtStr(amount)}" placeholder="₺0" required></div>
+        <div class="field"><label>Ne olarak biriktirdin?</label><select class="input" name="type">${types.map((t) => `<option value="${t}">${ASSETS[t].icon} ${ASSETS[t].name}</option>`).join('')}</select></div>
+        <div class="hint" id="prev" style="margin:-4px 0 12px"></div>
+        <button class="btn" type="submit">Aktar</button>
+      </form>`, (root) => {
+      const f = $('#f', root);
+      const upd = () => {
+        const a = parseAmount(f.amount.value) || 0, t = f.type.value, r = rateOf(t);
+        $('#prev', root).innerHTML = t === 'TRY' ? 'Birikimine TL olarak eklenir.' : r ? `Satış fiyatı ${money2(r.sell)} → yaklaşık <b>${num(a / r.sell)} ${ASSETS[t].unit === 'adet' || ASSETS[t].unit === 'gram' ? ASSETS[t].unit : ASSETS[t].unit}</b>` : '<span class="warn">Kur yok; TL olarak ekle.</span>';
+      };
+      f.amount.oninput = upd; f.type.onchange = upd; upd();
+      f.onsubmit = (ev) => {
+        ev.preventDefault();
+        const a = parseAmount(f.amount.value);
+        if (!(a > 0)) return toast('Geçerli bir tutar gir');
+        const t = f.type.value, r = rateOf(t);
+        if (t !== 'TRY' && !r) return toast('Kur bilgisi yok');
+        const price = t === 'TRY' ? 1 : r.sell;
+        state.savings.holdings.push({ id: uid(), type: t, qty: Math.round((a / price) * 10000) / 10000, buyPrice: price, date: todayISO(), note: `${monthName(key)} birikimi` });
+        m.saving = m.saving || { planned: 0, done: 0 };
+        m.saving.done = (m.saving.done || 0) + a;
+        save(); closeSheet(); toast(`${money(a)} birikime aktarıldı`); renderView();
+      };
+    });
+  }
+
+  // ---------- Sayfa: Giriş / Çıkış ----------
   function renderIslem() {
     const key = curMonthKey(), m = getMonth(key);
     if (!m) { view.innerHTML = emptyMonth(key); bindEmptyMonth(key); return; }
     const mode = state.ui.mode || 'gider';
-    if (state.ui.cat && !m.categories.some((c) => c.id === state.ui.cat)) {
-      // Ay değişince aynı isimli kategoriyi seçili tut
-      state.ui.cat = null;
-    }
+    if (state.ui.cat && !m.categories.some((c) => c.id === state.ui.cat)) state.ui.cat = null;
     const sel = m.categories.find((c) => c.id === state.ui.cat);
     const st = sel ? catStats(m, sel) : null;
     const s = calc(m, key);
     const defDate = monthKeyOf() === key ? todayISO() : `${key}-01`;
     const catById = Object.fromEntries(m.categories.map((c) => [c.id, c]));
-    const history = [...m.expenses].filter((e) => !sel || e.catId === sel.id).sort((a, b) => (b.date + b.id).localeCompare(a.date + a.id));
+    const subName = (e) => { const c = catById[e.catId]; const sb = c && e.subId && (c.subs || []).find((x) => x.id === e.subId); return sb ? sb.name : ''; };
+    const subFilter = state.ui.sub && sel && (sel.subs || []).some((x) => x.id === state.ui.sub) ? state.ui.sub : null;
+    const history = [...m.expenses].filter((e) => (!sel || e.catId === sel.id) && (!subFilter || e.subId === subFilter)).sort((a, b) => (b.date + b.id).localeCompare(a.date + a.id));
+    const pickOrder = [...s.varCats, ...s.fixedCats, ...s.instCats];
 
     const giderHTML = `
       <div class="card">
         <div class="card-head"><h3>Hangi kategori?</h3><button class="link-btn" id="new-cat">+ Yeni</button></div>
         <div class="cat-grid">
-          ${[...s.cats.filter((c) => !c.fixed), ...s.cats.filter((c) => c.fixed)].map((c) => `<button class="cat-pick ${sel && sel.id === c.id ? 'on' : ''}" data-pick="${c.id}">
-            <span class="e">${esc(c.emoji || '•')}</span><span class="n">${esc(c.name)}</span>
-            <span class="l ${c.diff < 0 ? 'bad' : ''}">${c.fixed && c.spent > 0 && c.diff >= 0 ? '✓ ödendi' : c.planned > 0 ? (c.diff < 0 ? '−' + money(-c.diff) : money(c.diff) + ' kaldı') : 'bütçesiz'}</span></button>`).join('')}
+          ${pickOrder.map((c) => `<button class="cat-pick ${sel && sel.id === c.id ? 'on' : ''}" data-pick="${c.id}">
+            <span class="e">${esc(c.emoji || '•')}</span><span class="n">${esc(catLabel(c))}</span>
+            <span class="l ${c.diff < 0 ? 'bad' : ''}">${isCommit(c) && c.spent > 0 && c.diff >= 0 ? '✓ ödendi' : c.planned > 0 ? (c.diff < 0 ? '−' + money(-c.diff) : money(c.diff) + ' kaldı') : 'bütçesiz'}</span></button>`).join('')}
         </div>
       </div>
 
       ${st ? `<div class="card">
-        <div class="card-head"><h3>${esc(st.emoji || '')} ${esc(st.name)}</h3><button class="link-btn" id="edit-sel">Düzenle</button></div>
+        <div class="card-head"><h3>${esc(st.emoji || '')} ${esc(catLabel(st))}</h3><button class="link-btn" id="edit-sel">Düzenle</button></div>
         <div class="stats" style="margin-top:0;grid-template-columns:repeat(3,1fr)">
           <div class="stat"><div class="k">Ayrılan</div><div class="v">${money(st.planned)}</div></div>
           <div class="stat"><div class="k">Harcanan</div><div class="v">${money(st.spent)}</div></div>
@@ -605,29 +822,34 @@
         </div>
         <div style="margin-top:12px">${catBar(st)}</div>
         <div class="cat-bottom"><span>${statusChip(st, s.phase)}</span><span class="muted">${st.planned > 0 ? '%' + Math.round((st.spent / st.planned) * 100) + ' kullanıldı' : ''}</span></div>
+        ${st.bySub.length ? `<div class="filters" style="margin-top:12px;margin-bottom:0">
+          <button data-sub="" class="${!subFilter ? 'on' : ''}">Tümü</button>
+          ${st.bySub.map((x) => `<button data-sub="${x.id}" class="${subFilter === x.id ? 'on' : ''}">${esc(x.name)} · ${money(x.spent)}</button>`).join('')}
+        </div>` : ''}
       </div>` : ''}
 
       <div class="card">
         <h3>Gider gir</h3>
         <form id="f" autocomplete="off">
           <div class="field"><input class="input big" name="amount" inputmode="decimal" placeholder="₺0" required></div>
-          <div class="field"><label>Ne aldın / nereye? <span class="muted">(yazınca kategori otomatik seçilir)</span></label>
+          <div class="field"><label>Ne aldın / nereye? <span class="muted">(yazınca kategori seçilir)</span></label>
             <input class="input" name="desc" list="desc-list" placeholder="ör. Boston, BİM, Trendyol">
             <datalist id="desc-list">${knownDescriptions().map((d) => `<option value="${esc(d)}">`).join('')}</datalist>
             <div class="hint" id="guess-hint"></div></div>
           <div class="field"><label>Kategori</label>
             <select class="input" name="catId" required>
               <option value="">Kategori seç</option>
-              ${m.categories.map((c) => `<option value="${c.id}" ${sel && sel.id === c.id ? 'selected' : ''}>${esc(c.emoji || '')} ${esc(c.name)}</option>`).join('')}
+              ${pickOrder.map((c) => `<option value="${c.id}" ${sel && sel.id === c.id ? 'selected' : ''}>${esc(c.emoji || '')} ${esc(catLabel(c))}</option>`).join('')}
             </select>
             <div class="hint" id="cat-left"></div></div>
+          <div class="field" id="sub-wrap"><label>Alt başlık</label><select class="input" name="subId"></select></div>
           <div class="row2">
             <div class="field"><label>Tarih</label><input class="input" type="date" name="date" value="${defDate}" required></div>
-            <div class="field"><label>Taksit</label><select class="input" name="taksit">${[1, 2, 3, 4, 5, 6, 9, 12].map((n) => `<option value="${n}">${n === 1 ? 'Tek çekim' : n + ' taksit'}</option>`).join('')}</select></div>
+            <div class="field"><label>Not</label><input class="input" name="note" placeholder="İsteğe bağlı"></div>
           </div>
-          <div class="field"><label>Not</label><input class="input" name="note" placeholder="İsteğe bağlı"></div>
           <label class="check"><input type="checkbox" name="extra"> Plan dışı / ekstra harcama</label>
           <button class="btn" type="submit">Kaydet</button>
+          <p class="hint">Taksitli bir alışveriş mi? <a href="#/odemeler">Ödemeler → Taksit ekle</a> ile her aya otomatik yazılır.</p>
         </form>
       </div>
 
@@ -635,9 +857,10 @@
       ${history.length ? `<div class="card" style="padding:4px 16px"><ul class="list">${history.map((e) => {
         const c = catById[e.catId];
         const extra = e.extra || !(+c?.planned > 0);
+        const sn = subName(e);
         return `<li class="tap" data-exp="${e.id}">
           <div class="main"><div class="title">${esc(e.desc || c?.name || 'Harcama')}</div>
-          <div class="sub">${shortDate(e.date)}${sel ? '' : ' · ' + esc(c ? (c.emoji || '') + ' ' + c.name : 'Kategorisiz')}${extra ? ' · <span class="warn">Ekstra</span>' : ''}${e.group ? ' · taksit' : ''}${e.note ? ' · ' + esc(e.note) : ''}</div></div>
+          <div class="sub">${shortDate(e.date)}${sel ? '' : ' · ' + esc(c ? (c.emoji || '') + ' ' + c.name : 'Kategorisiz')}${sn ? ' · ' + esc(sn) : ''}${extra ? ' · <span class="warn">Ekstra</span>' : ''}${e.note ? ' · ' + esc(e.note) : ''}</div></div>
           <div class="amt">−${money(e.amount)}</div></li>`;
       }).join('')}</ul>
       <div class="card-foot"><span class="muted small">${history.length} işlem</span><b>${money(sum(history, 'amount'))}</b></div></div>`
@@ -649,14 +872,15 @@
         <h3>Gelir gir</h3>
         <form id="fi" autocomplete="off">
           <div class="field"><input class="input big" name="amount" inputmode="decimal" placeholder="₺0" required></div>
-          <div class="field"><label>Gelir adı</label><input class="input" name="name" list="inc-list" placeholder="ör. Maaş, Ek iş, Prim" required>
+          <div class="field"><label>Gelir adı</label><input class="input" name="name" list="inc-list" placeholder="ör. Ek iş, Prim, Satış" required>
             <datalist id="inc-list">${[...new Set(monthKeys().flatMap((k) => state.months[k].incomes.map((i) => i.name)))].map((n) => `<option value="${esc(n)}">`).join('')}</datalist></div>
           <div class="field"><label>Not</label><input class="input" name="note" placeholder="İsteğe bağlı"></div>
+          <label class="check"><input type="checkbox" name="recurring"> Her ay gelen bir gelir (planıma ekle)</label>
           <button class="btn" type="submit">Geliri ekle</button>
         </form>
       </div>
       <div class="section-title">${monthName(key)} gelirleri</div>
-      <div class="card" style="padding:4px 16px"><ul class="list">${m.incomes.map((i) => `<li class="tap" data-inc="${i.id}"><div class="main"><div class="title">${esc(i.name)}</div>${i.note ? `<div class="sub">${esc(i.note)}</div>` : ''}</div><div class="amt good">+${money(i.amount)}</div></li>`).join('') || '<li class="muted small">Henüz gelir yok.</li>'}</ul>
+      <div class="card" style="padding:4px 16px"><ul class="list">${m.incomes.map((i) => `<li class="tap" data-inc="${i.id}"><div class="main"><div class="title">${esc(i.name)}</div><div class="sub">${i.tplId ? 'Her ay' : 'Sadece bu ay'}${i.note ? ' · ' + esc(i.note) : ''}</div></div><div class="amt good">+${money(i.amount)}</div></li>`).join('') || '<li class="muted small">Henüz gelir yok.</li>'}</ul>
       <div class="card-foot"><span class="muted small">Toplam</span><b>${money(s.income)}</b></div></div>`;
 
     view.innerHTML = `
@@ -671,106 +895,94 @@
         ev.preventDefault();
         const amount = parseAmount(fi.amount.value);
         if (!(amount > 0)) return toast('Geçerli bir tutar gir');
-        m.incomes.push({ id: uid(), name: fi.name.value.trim(), amount, note: fi.note.value.trim() });
+        const inc = { id: uid(), name: fi.name.value.trim(), amount, note: fi.note.value.trim() };
+        if (fi.recurring.checked && state.plan) {
+          const t = { id: uid(), name: inc.name, amount };
+          state.plan.incomes.push(t); inc.tplId = t.id;
+          m.incomes.push(inc); syncFuture(new Set([t.id]));
+        } else m.incomes.push(inc);
         save(); toast(`+${money(amount)} gelir eklendi`); renderIslem();
       };
       $$('[data-inc]', view).forEach((li) => (li.onclick = () => incomeForm(m, m.incomes.find((i) => i.id === li.dataset.inc))));
       return;
     }
 
-    $$('[data-pick]', view).forEach((b) => (b.onclick = () => { state.ui.cat = state.ui.cat === b.dataset.pick ? null : b.dataset.pick; renderIslem(); }));
-    $('#new-cat').onclick = () => categoryForm(m, null, false);
-    const es = $('#edit-sel'); if (es) es.onclick = () => categoryForm(m, sel);
-    const sa = $('#show-all'); if (sa) sa.onclick = () => { state.ui.cat = null; renderIslem(); };
+    $$('[data-pick]', view).forEach((b) => (b.onclick = () => { state.ui.cat = state.ui.cat === b.dataset.pick ? null : b.dataset.pick; state.ui.sub = null; renderIslem(); }));
+    $$('[data-sub]', view).forEach((b) => (b.onclick = () => { state.ui.sub = b.dataset.sub || null; renderIslem(); }));
+    $('#new-cat').onclick = () => categoryForm(m, null);
+    const es = $('#edit-sel'); if (es) es.onclick = () => (sel.kind === 'var' ? categoryForm(m, sel) : sel.kind === 'fixed' ? fixedForm(state.plan.fixed.find((x) => x.id === sel.tplId)) : installmentForm(state.installments.find((x) => x.id === sel.instId)));
+    const sa = $('#show-all'); if (sa) sa.onclick = () => { state.ui.cat = null; state.ui.sub = null; renderIslem(); };
     const csv = $('#csv'); if (csv) csv.onclick = () => exportCSV(m, key);
     $$('[data-exp]', view).forEach((li) => (li.onclick = () => expenseForm(m.expenses.find((e) => e.id === li.dataset.exp))));
 
     const f = $('#f');
     let touched = !!sel;
+    const fillSubs = (selSub) => {
+      const c = m.categories.find((x) => x.id === f.catId.value);
+      f.subId.innerHTML = subSelect(c, selSub);
+      $('#sub-wrap').hidden = !(c && c.subs && c.subs.length);
+    };
     const left = () => {
       const c = m.categories.find((x) => x.id === f.catId.value);
       const h = $('#cat-left');
       if (!c) { h.textContent = ''; return; }
       const cs = catStats(m, c);
-      const n = +f.taksit.value || 1;
-      const amt = (parseAmount(f.amount.value) || 0) / n;
-      const rest = cs.planned - cs.spent - amt;
+      const rest = cs.planned - cs.spent - (parseAmount(f.amount.value) || 0);
       h.innerHTML = cs.planned > 0
-        ? `Ayrılan ${money(cs.planned)} · harcanan ${money(cs.spent)} → bundan sonra <b class="${rest < 0 ? 'bad' : 'good'}">${rest < 0 ? money(-rest) + ' aşım' : money(rest) + ' kalır'}</b>${n > 1 ? ` (bu ay ${money(amt)})` : ''}`
+        ? `Ayrılan ${money(cs.planned)} · harcanan ${money(cs.spent)} → bundan sonra <b class="${rest < 0 ? 'bad' : 'good'}">${rest < 0 ? money(-rest) + ' aşım' : money(rest) + ' kalır'}</b>`
         : `<span class="warn">Bu kategoride bütçe yok — ekstra sayılır.</span>`;
     };
-    f.catId.onchange = () => { touched = true; left(); };
+    f.catId.onchange = () => { touched = true; fillSubs(); left(); };
     f.amount.oninput = left;
-    f.taksit.onchange = left;
     f.desc.oninput = () => {
-      if (touched) return;
       const g = guessCategory(f.desc.value, m);
-      if (g) { f.catId.value = g; $('#guess-hint').textContent = `✨ ${catById[g].name} seçildi`; left(); }
+      if (!g) return;
+      if (!touched) { f.catId.value = g.cat; fillSubs(g.sub); $('#guess-hint').textContent = `✨ ${catById[g.cat].name}${g.sub ? ' › ' + (catById[g.cat].subs.find((x) => x.id === g.sub) || {}).name : ''} seçildi`; left(); }
+      else if (f.catId.value === g.cat && g.sub) f.subId.value = g.sub;
     };
-    left();
+    fillSubs(subFilter); left();
     f.onsubmit = (ev) => {
       ev.preventDefault();
       const amount = parseAmount(f.amount.value);
       if (!(amount > 0)) return toast('Geçerli bir tutar gir');
       if (!f.catId.value) return toast('Kategori seç');
-      const data = { desc: f.desc.value.trim(), amount, catId: f.catId.value, date: f.date.value, extra: f.extra.checked, note: f.note.value.trim() };
-      const res = addExpense(m, key, data, +f.taksit.value || 1);
-      if (!res) return;
-      save();
-      state.ui.cat = res.catIdInView || state.ui.cat;
-      renderIslem();
-      toast(res.msg);
+      const data = { desc: f.desc.value.trim(), amount, catId: f.catId.value, subId: f.subId.value || undefined, date: f.date.value, extra: f.extra.checked, note: f.note.value.trim() };
+      const msg = addExpense(m, key, data);
+      save(); renderIslem(); toast(msg);
     };
   }
 
-  // Gideri ekler; taksitliyse sonraki aylara böler (gerekirse ayı/kategoriyi oluşturur)
-  function addExpense(m, key, data, n) {
+  function addExpense(m, key, data) {
     const targetKey = data.date.slice(0, 7);
-    const catName = m.categories.find((c) => c.id === data.catId)?.name;
-    const srcCat = m.categories.find((c) => c.id === data.catId);
-    const findCat = (mm) => {
-      let c = mm.categories.find((x) => lower(x.name) === lower(catName));
-      if (!c) { c = { ...srcCat, id: uid() }; mm.categories.push(c); }
-      return c;
-    };
-    const group = n > 1 ? uid() : undefined;
-    const per = Math.round((data.amount / n) * 100) / 100;
-    const day = Number(data.date.slice(8, 10));
-    let firstMonth = null, firstCat = null;
-    for (let i = 0; i < n; i++) {
-      const k = addMonth(targetKey, i);
-      const mm = k === key ? m : ensureMonth(k);
-      const c = mm === m && k === key ? srcCat : findCat(mm);
-      const amt = i === n - 1 ? Math.round((data.amount - per * (n - 1)) * 100) / 100 : per;
-      mm.expenses.push({
-        id: uid(), ...data, catId: c.id, amount: amt,
-        date: `${k}-${pad(Math.min(day, daysInMonth(k)))}`,
-        desc: n > 1 ? `${data.desc || catName} (${i + 1}/${n})` : data.desc,
-        ...(group ? { group, total: data.amount } : {}),
-      });
-      if (i === 0) { firstMonth = mm; firstCat = c; }
-    }
-    let msg = warnAfterSave(firstMonth, firstCat.id);
-    if (n > 1) msg = `${n} taksit: ayda ${money(per)} · ${msg}`;
-    if (targetKey !== key) msg = `${monthName(targetKey)} ayına kaydedildi · ${msg}`;
-    return { msg, catIdInView: targetKey === key ? firstCat.id : null };
+    if (targetKey === key) { m.expenses.push({ id: uid(), ...data }); return warnAfterSave(m, data.catId); }
+    const src = m.categories.find((c) => c.id === data.catId);
+    const tm = ensureMonth(targetKey);
+    let tc = tm.categories.find((c) => lower(c.name) === lower(src.name));
+    if (!tc) { tc = { ...clone(src), id: uid() }; tm.categories.push(tc); }
+    const sname = data.subId && (src.subs || []).find((s) => s.id === data.subId)?.name;
+    const ts = sname && (tc.subs || []).find((s) => lower(s.name) === lower(sname));
+    tm.expenses.push({ id: uid(), ...data, catId: tc.id, subId: ts ? ts.id : undefined });
+    return `${monthName(targetKey)} ayına kaydedildi · ${warnAfterSave(tm, tc.id)}`;
   }
 
   function exportCSV(m, key) {
     const catById = Object.fromEntries(m.categories.map((c) => [c.id, c]));
-    const rows = [['Tarih', 'Açıklama', 'Kategori', 'Tutar', 'Ekstra', 'Not']].concat(
-      [...m.expenses].sort((a, b) => a.date.localeCompare(b.date)).map((e) => [e.date, e.desc, catById[e.catId]?.name || '', String(e.amount).replace('.', ','), e.extra ? 'Evet' : 'Hayır', e.note || '']));
+    const rows = [['Tarih', 'Açıklama', 'Kategori', 'Alt başlık', 'Tutar', 'Ekstra', 'Not']].concat(
+      [...m.expenses].sort((a, b) => a.date.localeCompare(b.date)).map((e) => {
+        const c = catById[e.catId];
+        return [e.date, e.desc, c ? catLabel(c) : '', (c && e.subId && (c.subs || []).find((s) => s.id === e.subId)?.name) || '', String(e.amount).replace('.', ','), e.extra ? 'Evet' : 'Hayır', e.note || ''];
+      }));
     download(`harcamalar-${key}.csv`, '﻿' + rows.map((r) => r.map((x) => `"${String(x).replace(/"/g, '""')}"`).join(';')).join('\n'), 'text/csv');
   }
 
-  // Hızlı gider ekleme / düzenleme (alt sayfa)
   function expenseForm(exp) {
     const key = curMonthKey();
     const m = getMonth(key);
-    if (!m) { toast('Önce bu ay için bir plan oluştur'); return; }
-    if (!m.categories.length) { toast('Önce bir kategori ekle'); categoryForm(m, null, false); return; }
+    if (!m) { toast('Önce bu ay için planını uygula'); return; }
+    if (!m.categories.length) { toast('Önce bir kategori ekle'); categoryForm(m, null); return; }
     const isNew = !exp;
-    const e = exp || { desc: '', amount: '', catId: state.ui.cat || '', date: monthKeyOf() === key ? todayISO() : `${key}-01`, extra: false, note: '' };
+    const e = exp || { desc: '', amount: '', catId: state.ui.cat || '', subId: '', date: monthKeyOf() === key ? todayISO() : `${key}-01`, extra: false, note: '' };
+    const cats = [...m.categories.filter((c) => c.kind === 'var'), ...m.categories.filter(isCommit)];
     openSheet(isNew ? 'Gider ekle' : 'Gideri düzenle', `
       <form id="f" autocomplete="off">
         <div class="field"><input class="input big" name="amount" inputmode="decimal" placeholder="₺0" value="${amtStr(e.amount)}" required></div>
@@ -780,60 +992,47 @@
           <div class="hint" id="guess-hint"></div></div>
         <div class="field"><label>Hangi bütçeden düşsün?</label>
           <select class="input" name="catId" required><option value="">Kategori seç</option>
-            ${m.categories.map((c) => `<option value="${c.id}" ${c.id === e.catId ? 'selected' : ''}>${esc(c.emoji || '')} ${esc(c.name)}</option>`).join('')}</select>
+            ${cats.map((c) => `<option value="${c.id}" ${c.id === e.catId ? 'selected' : ''}>${esc(c.emoji || '')} ${esc(catLabel(c))}</option>`).join('')}</select>
           <div class="hint" id="cat-left"></div></div>
+        <div class="field" id="sub-wrap"><label>Alt başlık</label><select class="input" name="subId"></select></div>
         <div class="row2">
           <div class="field"><label>Tarih</label><input class="input" type="date" name="date" value="${e.date}" required></div>
-          ${isNew ? `<div class="field"><label>Taksit</label><select class="input" name="taksit">${[1, 2, 3, 4, 5, 6, 9, 12].map((n) => `<option value="${n}">${n === 1 ? 'Tek çekim' : n + ' taksit'}</option>`).join('')}</select></div>`
-                  : `<div class="field"><label>Not</label><input class="input" name="note" value="${esc(e.note || '')}"></div>`}
+          <div class="field"><label>Not</label><input class="input" name="note" value="${esc(e.note || '')}" placeholder="İsteğe bağlı"></div>
         </div>
-        ${isNew ? `<div class="field"><label>Not</label><input class="input" name="note" placeholder="İsteğe bağlı"></div>` : ''}
         <label class="check"><input type="checkbox" name="extra" ${e.extra ? 'checked' : ''}> Plan dışı / ekstra harcama</label>
         <button class="btn" type="submit">${isNew ? 'Kaydet' : 'Güncelle'}</button>
         ${isNew ? '' : `<div class="btn-row"><button class="btn danger" type="button" id="del">Sil</button>${e.group ? '<button class="btn danger" type="button" id="del-all">Tüm taksitleri sil</button>' : ''}</div>`}
       </form>`, (root) => {
       const f = $('#f', root);
       let touched = !!e.catId;
+      const fillSubs = (selSub) => { const c = m.categories.find((x) => x.id === f.catId.value); f.subId.innerHTML = subSelect(c, selSub); $('#sub-wrap', root).hidden = !(c && c.subs && c.subs.length); };
       const left = () => {
         const c = m.categories.find((x) => x.id === f.catId.value);
         const h = $('#cat-left', root);
         if (!c) { h.textContent = ''; return; }
         const spent = sum(m.expenses.filter((x) => x.catId === c.id && x.id !== e.id), 'amount');
-        const n = f.taksit ? +f.taksit.value || 1 : 1;
-        const rest = (+c.planned || 0) - spent - (parseAmount(f.amount.value) || 0) / n;
-        h.innerHTML = c.planned > 0
-          ? `Bundan sonra <b class="${rest < 0 ? 'bad' : 'good'}">${rest < 0 ? money(-rest) + ' aşım' : money(rest) + ' kalır'}</b>`
-          : `<span class="warn">Bu kategoride bütçe yok — ekstra sayılır.</span>`;
+        const rest = (+c.planned || 0) - spent - (parseAmount(f.amount.value) || 0);
+        h.innerHTML = c.planned > 0 ? `Bundan sonra <b class="${rest < 0 ? 'bad' : 'good'}">${rest < 0 ? money(-rest) + ' aşım' : money(rest) + ' kalır'}</b>` : `<span class="warn">Bu kategoride bütçe yok — ekstra sayılır.</span>`;
       };
-      f.catId.onchange = () => { touched = true; left(); };
+      f.catId.onchange = () => { touched = true; fillSubs(); left(); };
       f.amount.oninput = left;
-      if (f.taksit) f.taksit.onchange = left;
       f.desc.oninput = () => {
-        if (touched) return;
         const g = guessCategory(f.desc.value, m);
-        if (g) { f.catId.value = g; $('#guess-hint', root).textContent = '✨ Kategori otomatik seçildi'; left(); }
+        if (!g) return;
+        if (!touched) { f.catId.value = g.cat; fillSubs(g.sub); $('#guess-hint', root).textContent = '✨ Kategori otomatik seçildi'; left(); }
+        else if (f.catId.value === g.cat && g.sub) f.subId.value = g.sub;
       };
-      left();
+      fillSubs(e.subId); left();
       if (isNew) setTimeout(() => f.amount.focus(), 250);
       f.onsubmit = (ev) => {
         ev.preventDefault();
         const amount = parseAmount(f.amount.value);
         if (!(amount > 0)) return toast('Geçerli bir tutar gir');
         if (!f.catId.value) return toast('Kategori seç');
-        const data = { desc: f.desc.value.trim(), amount, catId: f.catId.value, date: f.date.value, extra: f.extra.checked, note: f.note.value.trim() };
-        if (isNew) {
-          const res = addExpense(m, key, data, +f.taksit.value || 1);
-          save(); closeSheet(); renderView(); toast(res.msg); return;
-        }
-        const targetKey = data.date.slice(0, 7);
-        if (targetKey !== key) {
-          const tm = ensureMonth(targetKey);
-          const cname = lower(m.categories.find((c) => c.id === data.catId)?.name);
-          let tc = tm.categories.find((c) => lower(c.name) === cname);
-          if (!tc) { tc = { ...m.categories.find((c) => c.id === data.catId), id: uid() }; tm.categories.push(tc); }
-          m.expenses = m.expenses.filter((x) => x.id !== e.id);
-          tm.expenses.push({ ...e, ...data, catId: tc.id });
-        } else Object.assign(e, data);
+        const data = { desc: f.desc.value.trim(), amount, catId: f.catId.value, subId: f.subId.value || undefined, date: f.date.value, extra: f.extra.checked, note: f.note.value.trim() };
+        if (isNew) { const msg = addExpense(m, key, data); save(); closeSheet(); renderView(); toast(msg); return; }
+        if (data.date.slice(0, 7) !== key) { m.expenses = m.expenses.filter((x) => x.id !== e.id); addExpense(m, key, data); }
+        else Object.assign(e, data);
         save(); closeSheet(); renderView(); toast('Güncellendi');
       };
       const del = $('#del', root);
@@ -849,14 +1048,17 @@
 
   function incomeForm(m, inc) {
     const isNew = !inc;
-    const i = inc || { name: 'Maaş', amount: '', note: '' };
+    const i = inc || { name: '', amount: '', note: '' };
+    const inPlan = !!(inc && inc.tplId);
     openSheet(isNew ? 'Gelir ekle' : 'Geliri düzenle', `
       <form id="f">
-        <div class="field"><label>Gelir adı</label><input class="input" name="name" value="${esc(i.name)}" required></div>
+        <div class="field"><label>Gelir adı</label><input class="input" name="name" value="${esc(i.name)}" placeholder="ör. Maaş, Ek iş" required></div>
         <div class="field"><label>Tutar</label><input class="input" name="amount" inputmode="decimal" value="${amtStr(i.amount)}" placeholder="₺0" required></div>
         <div class="field"><label>Not</label><input class="input" name="note" value="${esc(i.note || '')}" placeholder="İsteğe bağlı"></div>
+        <label class="check"><input type="checkbox" name="plan" ${inPlan ? 'checked' : ''}> Her ay gelir (planıma kayıtlı)</label>
         <button class="btn" type="submit">Kaydet</button>
-        ${isNew ? '' : '<div class="btn-row"><button class="btn danger" type="button" id="del">Sil</button></div>'}
+        ${isNew ? '' : `<div class="btn-row"><button class="btn danger" type="button" id="del">Bu aydan sil</button>${inPlan ? '<button class="btn danger" type="button" id="del-plan">Plandan da kaldır</button>' : ''}</div>
+        <p class="hint">“Bu aydan sil”: örneğin bu ay ek gelir olmadıysa. “Plandan da kaldır”: bundan sonraki aylarda da olmasın.</p>`}
       </form>`, (root) => {
       const f = $('#f', root);
       f.onsubmit = (ev) => {
@@ -864,51 +1066,507 @@
         const amount = parseAmount(f.amount.value);
         if (!(amount >= 0)) return toast('Geçerli bir tutar gir');
         const data = { name: f.name.value.trim(), amount, note: f.note.value.trim() };
-        if (isNew) m.incomes.push({ id: uid(), ...data }); else Object.assign(inc, data);
+        let target = inc;
+        if (isNew) { target = { id: uid(), ...data }; m.incomes.push(target); } else Object.assign(inc, data);
+        if (f.plan.checked && state.plan) {
+          let t = target.tplId && state.plan.incomes.find((x) => x.id === target.tplId);
+          if (!t) { t = { id: uid() }; state.plan.incomes.push(t); target.tplId = t.id; }
+          Object.assign(t, { name: data.name, amount: data.amount });
+          syncFuture(new Set([t.id]));
+        } else if (!f.plan.checked && target.tplId && state.plan) {
+          state.plan.incomes = state.plan.incomes.filter((x) => x.id !== target.tplId);
+          delete target.tplId; syncFuture(new Set());
+        }
         save(); closeSheet(); renderView();
       };
       const del = $('#del', root);
-      if (del) del.onclick = () => { if (confirm('Gelir silinsin mi?')) { m.incomes = m.incomes.filter((x) => x.id !== inc.id); save(); closeSheet(); renderView(); } };
+      if (del) del.onclick = () => {
+        if (!confirm(`${inc.name} bu aydan silinsin mi?`)) return;
+        m.incomes = m.incomes.filter((x) => x.id !== inc.id);
+        if (inc.tplId) { m.skip = m.skip || []; m.skip.push(inc.tplId); }
+        save(); closeSheet(); toast('Bu aydan silindi'); renderView();
+      };
+      const dp = $('#del-plan', root);
+      if (dp) dp.onclick = () => {
+        if (!confirm(`${inc.name} planından ve bu aydan kaldırılsın mı?`)) return;
+        state.plan.incomes = state.plan.incomes.filter((x) => x.id !== inc.tplId);
+        m.incomes = m.incomes.filter((x) => x.id !== inc.id);
+        syncFuture(new Set());
+        save(); closeSheet(); toast('Plandan kaldırıldı'); renderView();
+      };
     });
   }
 
-  function categoryForm(m, cat, fixedDefault) {
+  // Değişken kategori: ad, simge, tutar, alt başlıklar, artanı birikime
+  function categoryForm(m, cat) {
     const isNew = !cat;
-    const c = cat || { name: '', planned: '', fixed: !!fixedDefault, emoji: '' };
+    const c = cat ? clone(cat) : { name: '', planned: '', emoji: '', subs: [], toSavings: false };
+    c.subs = c.subs || [];
     const used = cat ? m.expenses.filter((e) => e.catId === cat.id) : [];
     const others = cat ? m.categories.filter((x) => x.id !== cat.id) : [];
-    openSheet(isNew ? (c.fixed ? 'Sabit gider ekle' : 'Kategori ekle') : 'Düzenle', `
+    const draw = () => openSheet(isNew ? 'Kategori ekle' : 'Kategoriyi düzenle', `
       <form id="f">
         <div class="row2" style="grid-template-columns:80px 1fr">
-          <div class="field"><label>Simge</label><input class="input" name="emoji" value="${esc(c.emoji || '')}" maxlength="4" placeholder="${c.fixed ? '💳' : '👕'}" style="text-align:center"></div>
-          <div class="field"><label>Ad</label><input class="input" name="name" value="${esc(c.name)}" placeholder="${c.fixed ? 'ör. Kira, Elektrik' : 'ör. Kıyafet'}" required></div>
+          <div class="field"><label>Simge</label><input class="input" name="emoji" value="${esc(c.emoji || '')}" maxlength="4" placeholder="🛍️" style="text-align:center"></div>
+          <div class="field"><label>Ad</label><input class="input" name="name" value="${esc(c.name)}" placeholder="ör. İhtiyaçlarım" required></div>
         </div>
-        <div class="field"><label>${monthName(curMonthKey())} için ayrılan tutar</label><input class="input" name="planned" inputmode="decimal" value="${amtStr(c.planned)}" placeholder="₺0 (0 = bütçesiz)"></div>
-        <label class="check"><input type="checkbox" name="fixed" ${c.fixed ? 'checked' : ''}> Sabit gider (fatura, kredi kartı, kira, abonelik) — ana sayfada “Öde” düğmesiyle görünür</label>
+        <div class="field"><label>Ayrılan tutar</label><input class="input" name="planned" inputmode="decimal" value="${amtStr(c.planned)}" placeholder="₺0"></div>
+        <div class="field"><label>Alt başlıklar</label>
+          <div class="subs" style="margin-top:0">${c.subs.map((s) => `<span class="chip neutral">${esc(s.name)} <button type="button" class="x-s" data-dsub="${s.id}">✕</button></span>`).join('')}
+            <input class="input sub-in" id="new-sub" placeholder="+ alt başlık ekle"></div>
+          <div class="hint">ör. Kıyafet, Kozmetik, Ev ihtiyaçları. Harcamayı girerken seçersin.</div></div>
+        <label class="check"><input type="checkbox" name="toSavings" ${c.toSavings ? 'checked' : ''}> Ay sonunda artarsa birikime aktarılacak</label>
+        <label class="check"><input type="checkbox" name="plan" ${isNew || cat.tplId ? 'checked' : ''}> Planıma kaydet (sonraki aylarda da böyle olsun)</label>
         <button class="btn" type="submit">Kaydet</button>
         ${isNew ? '' : `
           ${used.length && others.length ? `<div class="field" style="margin-top:14px"><label>Silerken ${used.length} harcamayı şuraya taşı</label>
-            <select class="input" name="moveTo">${others.map((o) => `<option value="${o.id}">${esc(o.emoji || '')} ${esc(o.name)}</option>`).join('')}</select></div>` : ''}
-          <div class="btn-row"><button class="btn danger" type="button" id="del">Kategoriyi sil</button></div>`}
+            <select class="input" name="moveTo">${others.map((o) => `<option value="${o.id}">${esc(o.emoji || '')} ${esc(catLabel(o))}</option>`).join('')}</select></div>` : ''}
+          <div class="btn-row"><button class="btn danger" type="button" id="del">Kategoriyi sil</button></div>
+          <p class="hint">“Planıma kaydet” işaretliyse kategori sonraki aylardan da kalkar; değilse sadece bu aydan.</p>`}
       </form>`, (root) => {
       const f = $('#f', root);
+      const keep = () => { c.name = f.name.value; c.emoji = f.emoji.value; c.planned = f.planned.value; c.toSavings = f.toSavings.checked; };
+      $('#new-sub', root).addEventListener('keydown', (ev) => { if (ev.key === 'Enter') { ev.preventDefault(); ev.target.blur(); } });
+      $('#new-sub', root).onchange = (ev) => { const n = ev.target.value.trim(); if (!n) return; keep(); c.subs.push({ id: uid(), name: n }); draw(); setTimeout(() => $('#new-sub').focus(), 50); };
+      $$('[data-dsub]', root).forEach((b) => (b.onclick = () => {
+        const inUse = m.expenses.some((e) => e.subId === b.dataset.dsub);
+        if (inUse && !confirm('Bu alt başlıkta harcama var; harcamalar alt başlıksız kalır. Silinsin mi?')) return;
+        keep(); c.subs = c.subs.filter((s) => s.id !== b.dataset.dsub); draw();
+      }));
       f.onsubmit = (ev) => {
         ev.preventDefault();
         const planned = f.planned.value.trim() ? parseAmount(f.planned.value) : 0;
         if (!(planned >= 0)) return toast('Geçerli bir tutar gir');
-        const data = { name: f.name.value.trim(), planned, fixed: f.fixed.checked, emoji: f.emoji.value.trim() };
-        if (isNew) m.categories.push({ id: uid(), ...data }); else Object.assign(cat, data);
+        const data = { name: f.name.value.trim(), planned, emoji: f.emoji.value.trim(), subs: clone(c.subs), toSavings: f.toSavings.checked };
+        let target = cat;
+        if (isNew) { target = { id: uid(), kind: 'var', ...data }; m.categories.push(target); } else Object.assign(cat, data);
+        m.expenses.forEach((e) => { if (e.catId === target.id && e.subId && !data.subs.some((s) => s.id === e.subId)) delete e.subId; });
+        if (f.plan.checked && state.plan) {
+          let t = target.tplId && state.plan.categories.find((x) => x.id === target.tplId);
+          if (!t) { t = { id: uid() }; state.plan.categories.push(t); target.tplId = t.id; }
+          Object.assign(t, clone(data));
+          syncFuture(new Set([t.id]));
+        }
         save(); closeSheet(); toast('Kaydedildi'); renderView();
       };
       const del = $('#del', root);
       if (del) del.onclick = () => {
         if (used.length && !others.length) return toast('Önce bu kategorideki harcamaları sil');
-        const msg = used.length ? `${cat.name} silinsin ve ${used.length} harcama taşınsın mı?` : `${cat.name} silinsin mi?`;
-        if (!confirm(msg)) return;
-        if (used.length) { const to = f.moveTo.value; used.forEach((e) => (e.catId = to)); }
+        if (!confirm(used.length ? `${cat.name} silinsin ve ${used.length} harcama taşınsın mı?` : `${cat.name} silinsin mi?`)) return;
+        if (used.length) { const to = f.moveTo.value; used.forEach((e) => { e.catId = to; delete e.subId; }); }
         m.categories = m.categories.filter((x) => x.id !== cat.id);
+        if (cat.tplId) {
+          if (f.plan.checked && state.plan) { state.plan.categories = state.plan.categories.filter((x) => x.id !== cat.tplId); syncFuture(new Set()); }
+          else { m.skip = m.skip || []; m.skip.push(cat.tplId); }
+        }
         if (state.ui.cat === cat.id) state.ui.cat = null;
         save(); closeSheet(); toast('Silindi'); renderView();
+      };
+    });
+    draw();
+  }
+
+  // ---------- Sayfa: Ödemeler (sabit giderler + taksitler) ----------
+  function renderOdemeler() {
+    if (!state.plan) { view.innerHTML = emptyMonth(curMonthKey()); bindEmptyMonth(curMonthKey()); return; }
+    const key = curMonthKey(), m = getMonth(key);
+    const stOf = (pred) => (m ? m.categories.find(pred) : null);
+    const paidOf = (c) => (c ? sum(m.expenses.filter((e) => e.catId === c.id), 'amount') : 0);
+    const active = state.installments.filter((i) => instActive(i, key));
+    const upcoming = state.installments.filter((i) => i.start > key);
+    const done = state.installments.filter((i) => !instActive(i, key) && i.start <= key);
+    const fixedTotal = sum(state.plan.fixed, 'amount'), instTotal = sum(active, 'monthly');
+    const next = Array.from({ length: 6 }, (_, n) => addMonth(monthKeyOf(), n)).map((k) => ({ k, f: fixedTotal, t: sum(state.installments.filter((i) => instActive(i, k)), 'monthly') }));
+    const maxN = Math.max(1, ...next.map((x) => x.f + x.t));
+
+    const statusBtn = (c, attr) => {
+      if (!m) return '';
+      if (!c) return '<span class="chip neutral">Bu ayda yok</span>';
+      const paid = paidOf(c);
+      return paid > 0 ? `<span class="chip good">✓ ${money(paid)}</span>` : `<button class="btn small" data-pay="${c.id}" ${attr || ''}>Öde</button>`;
+    };
+    view.innerHTML = `
+      <div class="card hero">
+        <div class="hero-label">${monthName(key)} düzenli ödemeler</div>
+        <div class="hero-num">${money(fixedTotal + instTotal)}</div>
+        <div class="hero-sub">Sabit ${money(fixedTotal)} · Taksit ${money(instTotal)}</div>
+      </div>
+
+      <div class="card">
+        <div class="card-head"><h3>📌 Sabit giderlerim</h3><button class="btn small" id="add-fix">+ Ekle</button></div>
+        <ul class="list">${state.plan.fixed.map((t) => {
+          const c = stOf((x) => x.tplId === t.id);
+          return `<li><div class="main tap" data-fix="${t.id}"><div class="title">${esc(t.emoji || '•')} ${esc(t.name)}</div><div class="sub">Her ay ${money(t.amount)} · düzenlemek için dokun</div></div>
+            <div class="right">${statusBtn(c)}</div></li>`;
+        }).join('') || '<li class="muted small">Kira, kredi kartı, fatura, abonelik gibi her ay ödediklerini ekle.</li>'}</ul>
+      </div>
+
+      <div class="card">
+        <div class="card-head"><h3>🧾 Taksitlerim</h3><button class="btn small" id="add-inst">+ Taksit</button></div>
+        ${active.length ? `<ul class="list">${active.map((i) => {
+          const seq = monthDiff(i.start, key) + 1, leftN = i.count - seq;
+          const c = stOf((x) => x.instId === i.id);
+          return `<li><div class="main tap" data-inst="${i.id}">
+              <div class="title">${esc(i.emoji || '🧾')} ${esc(i.name)} <span class="muted small">${seq}/${i.count}</span></div>
+              <div class="sub">Ayda ${money(i.monthly)} · kalan borç ${money(i.monthly * (leftN + (paidOf(c) > 0 ? 0 : 1)))} · son taksit ${monthName(addMonth(i.start, i.count - 1), true)}</div>
+              <div class="bar" style="margin-top:6px"><i style="width:${(seq / i.count) * 100}%"></i></div></div>
+            <div class="right">${statusBtn(c)}</div></li>`;
+        }).join('')}</ul>` : '<p class="muted small" style="margin:0">Bu ay aktif taksit yok.</p>'}
+        ${upcoming.length ? `<div class="section-title" style="margin-top:14px">Başlayacak</div><ul class="list">${upcoming.map((i) => `<li class="tap" data-inst="${i.id}"><div class="main"><div class="title">${esc(i.name)}</div><div class="sub">${monthName(i.start)} başlar · ${i.count} × ${money(i.monthly)}</div></div></li>`).join('')}</ul>` : ''}
+        ${done.length ? `<details style="margin-top:10px"><summary class="muted small">Biten taksitler (${done.length})</summary><ul class="list">${done.map((i) => `<li class="tap" data-inst="${i.id}"><div class="main"><div class="title">${esc(i.name)}</div><div class="sub">${i.count} × ${money(i.monthly)} · ${monthName(addMonth(i.start, i.count - 1), true)} bitti</div></div><span class="chip good">✓</span></li>`).join('')}</ul></details>` : ''}
+      </div>
+
+      <div class="card">
+        <h3>Önümüzdeki 6 ay</h3>
+        ${next.map((x) => `<div style="display:grid;grid-template-columns:62px 1fr 92px;gap:10px;align-items:center;padding:6px 0">
+          <span class="small muted">${monthName(x.k, true)}</span>
+          <div class="bar"><i style="width:${((x.f + x.t) / maxN) * 100}%"></i></div>
+          <span class="small right"><b>${money(x.f + x.t)}</b>${x.t ? `<br><span class="muted tiny">taksit ${money(x.t)}</span>` : ''}</span></div>`).join('')}
+        <p class="hint">Taksit bittiğinde o ay kendiliğinden düşer.</p>
+      </div>`;
+
+    $('#add-fix').onclick = () => fixedForm();
+    $('#add-inst').onclick = () => installmentForm();
+    $$('[data-fix]', view).forEach((el) => (el.onclick = () => fixedForm(state.plan.fixed.find((x) => x.id === el.dataset.fix))));
+    $$('[data-inst]', view).forEach((el) => (el.onclick = () => installmentForm(state.installments.find((x) => x.id === el.dataset.inst))));
+    $$('[data-pay]', view).forEach((b) => (b.onclick = () => payFixed(m, key, m.categories.find((x) => x.id === b.dataset.pay))));
+  }
+
+  function fixedForm(t) {
+    const isNew = !t;
+    const x = t || { name: '', emoji: '', amount: '' };
+    openSheet(isNew ? 'Sabit gider ekle' : 'Sabit gideri düzenle', `
+      <form id="f">
+        <div class="row2" style="grid-template-columns:80px 1fr">
+          <div class="field"><label>Simge</label><input class="input" name="emoji" value="${esc(x.emoji || '')}" maxlength="4" placeholder="💳" style="text-align:center"></div>
+          <div class="field"><label>Ad</label><input class="input" name="name" value="${esc(x.name)}" list="fix-sug" placeholder="ör. Kira, Kredi kartı" required>
+            <datalist id="fix-sug">${SUGGEST_FIXED.map(([n]) => `<option value="${n}">`).join('')}</datalist></div>
+        </div>
+        <div class="field"><label>Aylık tutar</label><input class="input big" name="amount" inputmode="decimal" value="${amtStr(x.amount)}" placeholder="₺0" required></div>
+        <p class="hint" style="margin-top:-4px">Bu ay ve sonraki aylar güncellenir; geçmiş aylar olduğu gibi kalır. Tutarı sadece bu ay farklıysa “Öde” derken değiştir.</p>
+        <button class="btn" type="submit">Kaydet</button>
+        ${isNew ? '' : '<div class="btn-row"><button class="btn danger" type="button" id="del">Sil</button></div>'}
+      </form>`, (root) => {
+      const f = $('#f', root);
+      f.name.onchange = () => { const s = SUGGEST_FIXED.find(([n]) => lower(n) === lower(f.name.value)); if (s && !f.emoji.value) f.emoji.value = s[1]; };
+      f.onsubmit = (ev) => {
+        ev.preventDefault();
+        const amount = parseAmount(f.amount.value);
+        if (!(amount > 0)) return toast('Geçerli bir tutar gir');
+        const data = { name: f.name.value.trim(), emoji: f.emoji.value.trim() || '📌', amount };
+        let id;
+        if (isNew) { id = uid(); state.plan.fixed.push({ id, ...data }); } else { Object.assign(t, data); id = t.id; }
+        syncFuture(new Set([id]));
+        save(); closeSheet(); toast('Kaydedildi'); renderView();
+      };
+      const del = $('#del', root);
+      if (del) del.onclick = () => {
+        if (!confirm(`${t.name} sabit giderlerinden kaldırılsın mı? (Ödenmiş aylar korunur)`)) return;
+        state.plan.fixed = state.plan.fixed.filter((y) => y.id !== t.id);
+        syncFuture(new Set());
+        save(); closeSheet(); toast('Kaldırıldı'); renderView();
+      };
+    });
+  }
+
+  function installmentForm(inst) {
+    const isNew = !inst;
+    const now = monthKeyOf();
+    const x = inst || { name: '', emoji: '🧾', monthly: '', count: 3, start: now };
+    const curSeq = inst ? clamp(monthDiff(inst.start, now) + 1, 1, inst.count) : 1;
+    openSheet(isNew ? 'Taksit ekle' : 'Taksiti düzenle', `
+      <form id="f">
+        <div class="row2" style="grid-template-columns:80px 1fr">
+          <div class="field"><label>Simge</label><input class="input" name="emoji" value="${esc(x.emoji || '')}" maxlength="4" style="text-align:center"></div>
+          <div class="field"><label>Ne aldın?</label><input class="input" name="name" value="${esc(x.name)}" placeholder="ör. Telefon, Zara, Buzdolabı" required></div>
+        </div>
+        <div class="seg" id="tmode"><button type="button" data-t="monthly" class="on">Aylık tutar</button><button type="button" data-t="total">Toplam tutar</button></div>
+        <div class="field"><label id="amt-l">Aylık taksit tutarı</label><input class="input big" name="amount" inputmode="decimal" value="${amtStr(x.monthly)}" placeholder="₺0" required></div>
+        <div class="row2">
+          <div class="field"><label>Toplam taksit sayısı</label><input class="input" name="count" inputmode="numeric" value="${x.count}" required></div>
+          <div class="field"><label>Bu ay kaçıncı taksit?</label><input class="input" name="seq" inputmode="numeric" value="${curSeq}"></div>
+        </div>
+        <div class="hint" id="calc" style="margin:-4px 0 12px"></div>
+        <button class="btn" type="submit">Kaydet</button>
+        ${isNew ? '' : '<div class="btn-row"><button class="btn danger" type="button" id="del">Taksiti sil</button></div>'}
+      </form>`, (root) => {
+      const f = $('#f', root);
+      let mode = 'monthly';
+      const vals = () => {
+        const n = Math.max(1, parseInt(f.count.value, 10) || 1);
+        const seq = clamp(parseInt(f.seq.value, 10) || 1, 1, n);
+        const a = parseAmount(f.amount.value) || 0;
+        const monthly = mode === 'monthly' ? a : Math.round((a / n) * 100) / 100;
+        return { n, seq, monthly, start: addMonth(now, -(seq - 1)) };
+      };
+      const upd = () => {
+        const v = vals();
+        $('#calc', root).innerHTML = v.monthly > 0 ? `Ayda <b>${money2(v.monthly)}</b> · toplam ${money(v.monthly * v.n)} · ${monthName(v.start, true)} → ${monthName(addMonth(v.start, v.n - 1), true)} · kalan ${v.n - v.seq + 1} taksit (${money(v.monthly * (v.n - v.seq + 1))})` : '';
+      };
+      $$('#tmode button', root).forEach((b) => (b.onclick = () => {
+        mode = b.dataset.t; $$('#tmode button', root).forEach((y) => y.classList.toggle('on', y === b));
+        $('#amt-l', root).textContent = mode === 'monthly' ? 'Aylık taksit tutarı' : 'Toplam tutar'; upd();
+      }));
+      f.amount.oninput = upd; f.count.oninput = upd; f.seq.oninput = upd; upd();
+      f.onsubmit = (ev) => {
+        ev.preventDefault();
+        const v = vals();
+        if (!(v.monthly > 0)) return toast('Geçerli bir tutar gir');
+        const data = { name: f.name.value.trim(), emoji: f.emoji.value.trim() || '🧾', monthly: v.monthly, count: v.n, start: v.start };
+        let id;
+        if (isNew) { id = uid(); state.installments.push({ id, ...data }); } else { Object.assign(inst, data); id = inst.id; }
+        if (!state.months[now] && state.plan) buildMonth(now);
+        syncFuture(new Set([id]));
+        save(); closeSheet(); toast(`${data.name}: ${data.count} × ${money(data.monthly)}`); renderView();
+      };
+      const del = $('#del', root);
+      if (del) del.onclick = () => {
+        if (!confirm(`${inst.name} taksiti silinsin mi? (Ödenmiş taksitler geçmişte kalır)`)) return;
+        state.installments = state.installments.filter((y) => y.id !== inst.id);
+        syncFuture(new Set());
+        save(); closeSheet(); toast('Silindi'); renderView();
+      };
+    });
+  }
+
+  // ---------- Plan sihirbazı ----------
+  const WSTEPS = ['Gelirlerin', 'Harcama kategorilerin', 'Düzenli ödemelerin', 'Birikim planın', 'Kalanı dağıt', 'Özet'];
+  function openWizard(mode) {
+    const base = mode === 'edit' && state.plan ? clone(state.plan) : {
+      incomes: [{ id: uid(), name: 'Maaş', amount: 0 }], fixed: [], saving: 0,
+      categories: SUGGEST_CATS.filter((s) => s.def).map((s) => ({ id: uid(), name: s.name, emoji: s.emoji, planned: 0, subs: (s.subs || []).map((n) => ({ id: uid(), name: n })), toSavings: !!s.toSavings })),
+    };
+    if (!base.incomes.length) base.incomes.push({ id: uid(), name: 'Maaş', amount: 0 });
+    const w = { step: 0, mode, plan: base, inst: clone(state.installments || []), newInst: [], apply: true };
+    drawWizard(w);
+  }
+  function wTotals(w) {
+    const now = monthKeyOf();
+    const income = sum(w.plan.incomes, 'amount');
+    const fixed = sum(w.plan.fixed, 'amount');
+    const taksit = sum(w.inst.filter((i) => instActive(i, now)), 'monthly') + sum(w.newInst, 'monthly');
+    const afterFixed = income - fixed - taksit;
+    const kalan = afterFixed - (w.plan.saving || 0);
+    const alloc = sum(w.plan.categories, 'planned');
+    return { income, fixed, taksit, afterFixed, kalan, alloc, unalloc: kalan - alloc };
+  }
+  function drawWizard(w) {
+    const t = wTotals(w);
+    const p = w.plan;
+    const now = monthKeyOf();
+    let body = '';
+    if (w.step === 0) {
+      body = `<p class="muted small" style="margin-top:0">Maaşın ve varsa ek gelirlerin. Bir ay ek gelir olmazsa o ay ana sayfadan silebilirsin.</p>
+        ${p.incomes.map((x, idx) => `<div class="wrow"><input class="input" data-f="inc-name" data-id="${x.id}" value="${esc(x.name)}" placeholder="${idx ? 'Ek gelir adı' : 'Maaş'}">
+          <input class="input" data-f="inc-amt" data-id="${x.id}" inputmode="decimal" value="${amtStr(x.amount)}" placeholder="₺0">
+          <button type="button" class="x" data-del="inc" data-id="${x.id}" aria-label="Sil">✕</button></div>`).join('')}
+        <button type="button" class="link-btn" data-add="inc">+ Ek gelir ekle</button>
+        <div class="wbox" style="margin-top:12px">Toplam gelir<div class="big" id="w-a">${money(t.income)}</div></div>`;
+    } else if (w.step === 1) {
+      const custom = p.categories.filter((c) => !SUGGEST_CATS.some((s) => lower(s.name) === lower(c.name)));
+      body = `<p class="muted small" style="margin-top:0">Hangi kategorilerde harcama yapıyorsun? Dokunarak seç; alt başlık ekleyebilir, silebilirsin.</p>
+        <div class="chips">${SUGGEST_CATS.map((s) => `<button type="button" data-tog="${esc(s.name)}" class="${p.categories.some((c) => lower(c.name) === lower(s.name)) ? 'on' : ''}">${s.emoji} ${esc(s.name)}</button>`).join('')}
+          ${custom.map((c) => `<button type="button" class="on" data-tog="${esc(c.name)}">${esc(c.emoji || '•')} ${esc(c.name)}</button>`).join('')}</div>
+        <div class="wrow" style="grid-template-columns:1fr auto"><input class="input" id="w-newcat" placeholder="Kendi kategorin (ör. Kahve)"><button type="button" class="btn small" data-add="cat">Ekle</button></div>
+        <div class="section-title">Seçtiklerin (${p.categories.length})</div>
+        ${p.categories.map((c) => `<div class="wcat">
+          <div class="wcat-h"><span style="font-size:20px">${esc(c.emoji || '•')}</span><input class="input" data-f="cat-name" data-id="${c.id}" value="${esc(c.name)}"><button type="button" class="x" data-del="cat" data-id="${c.id}">✕</button></div>
+          <div class="subs">${(c.subs || []).map((s) => `<span class="chip neutral">${esc(s.name)} <button type="button" class="x-s" data-delsub="${c.id}" data-sid="${s.id}">✕</button></span>`).join('')}
+            <input class="input sub-in" data-addsub="${c.id}" placeholder="+ alt başlık"></div>
+          <label class="check slim"><input type="checkbox" data-f="cat-sav" data-id="${c.id}" ${c.toSavings ? 'checked' : ''}> Artarsa birikime aktar</label>
+        </div>`).join('')}`;
+    } else if (w.step === 2) {
+      const curInst = w.inst.filter((i) => instActive(i, now) || i.start > now);
+      body = `<p class="muted small" style="margin-top:0">Her ay düzenli ödediklerin: kira, kredi kartı, fatura, abonelik, kurs…</p>
+        <div class="chips">${SUGGEST_FIXED.filter(([n]) => !p.fixed.some((f) => lower(f.name) === lower(n))).map(([n, e]) => `<button type="button" data-addfix="${n}" data-e="${e}">${e} ${n}</button>`).join('')}</div>
+        ${p.fixed.map((x) => `<div class="wrow emoji"><input class="input" data-f="fix-emoji" data-id="${x.id}" value="${esc(x.emoji || '')}" style="text-align:center">
+          <input class="input" data-f="fix-name" data-id="${x.id}" value="${esc(x.name)}" placeholder="Ad">
+          <input class="input" data-f="fix-amt" data-id="${x.id}" inputmode="decimal" value="${amtStr(x.amount)}" placeholder="₺0">
+          <button type="button" class="x" data-del="fix" data-id="${x.id}">✕</button></div>`).join('')}
+        <button type="button" class="link-btn" data-add="fix">+ Başka sabit gider ekle</button>
+        <div class="section-title">Taksitlerin</div>
+        ${curInst.map((i) => `<div class="wrow" style="grid-template-columns:1fr 36px"><div class="small"><b>${esc(i.name)}</b> · ayda ${money(i.monthly)} · ${clamp(monthDiff(i.start, now) + 1, 0, i.count)}/${i.count}</div><button type="button" class="x" data-del="inst" data-id="${i.id}">✕</button></div>`).join('')}
+        ${w.newInst.length ? '<div class="small muted" style="margin-bottom:6px">Ad · aylık tutar · kalan taksit sayısı</div>' : ''}
+        ${w.newInst.map((i) => `<div class="wrow three"><input class="input" data-f="ni-name" data-id="${i.id}" value="${esc(i.name)}" placeholder="ör. Telefon">
+          <input class="input" data-f="ni-amt" data-id="${i.id}" inputmode="decimal" value="${amtStr(i.monthly)}" placeholder="₺/ay">
+          <input class="input" data-f="ni-cnt" data-id="${i.id}" inputmode="numeric" value="${i.count || ''}" placeholder="adet">
+          <button type="button" class="x" data-del="ninst" data-id="${i.id}">✕</button></div>`).join('')}
+        <button type="button" class="link-btn" data-add="ninst">+ Taksit ekle</button>
+        <div class="wbox" style="margin-top:12px">Sabit ${money(t.fixed)} + taksit ${money(t.taksit)}<div class="big" id="w-a">${money(t.fixed + t.taksit)}</div><span class="small muted">Gelirden sonra kalan: <b id="w-b">${money(t.afterFixed)}</b></span></div>`;
+    } else if (w.step === 3) {
+      const sug = suggestPlan(t.income, t.fixed + t.taksit, p.categories).saving;
+      const opts = [[0, 'Şimdilik yok', 'birikim yapmıyorum'], [round50(t.income * 0.1), '%10', 'gelirin onda biri'], [round50(t.income * 0.2), '%20', 'klasik 50/30/20 kuralı'], [sug, 'Önerilen', 'sana göre hesaplandı']];
+      body = `<p class="muted small" style="margin-top:0">Önce birikimini ayır, harcamaları kalandan yap. Bu ay ne kadar biriktirmek istiyorsun?</p>
+        <div class="wbox">Gelir − sabit giderler − taksitler<div class="big">${money(t.afterFixed)}</div></div>
+        <div class="wopt">${opts.map(([v, n, d]) => `<button type="button" data-sav="${v}" class="${(p.saving || 0) === v ? 'on' : ''}"><b>${money(v)}</b><span>${n} · ${d}</span></button>`).join('')}</div>
+        <div class="field"><label>Ya da kendin yaz</label><input class="input big" data-f="saving" inputmode="decimal" value="${amtStr(p.saving)}" placeholder="₺0"></div>
+        <p class="hint">Önerilen: gelirinin %20'si, ama sabit giderlerden sonra kalanın en fazla %40'ı — böylece günlük harcamalara yeterli pay kalır.</p>
+        <div class="wbox">Birikimden sonra kalan (kategorilere dağıtacağın)<div class="big ${t.kalan < 0 ? 'bad' : ''}" id="w-a">${money(t.kalan)}</div></div>`;
+    } else if (w.step === 4) {
+      const sp = suggestPlan(t.income, t.fixed + t.taksit, p.categories);
+      body = `<div class="wbox">Kalan (dağıtılabilir)<div class="big ${t.kalan < 0 ? 'bad' : ''}">${money(t.kalan)}</div><span class="small muted">Gelir ${money(t.income)} − sabit ${money(t.fixed)} − taksit ${money(t.taksit)} − birikim ${money(p.saving || 0)}</span></div>
+        <p class="muted small">Kalanı kategorilerine sen dağıt. Örneğin İhtiyaçlarım'a kendine ayırdığını yaz.</p>
+        ${p.categories.map((c) => `<div class="dist-row"><div><div style="font-weight:600">${esc(c.emoji || '•')} ${esc(c.name)}</div>${(c.subs || []).length ? `<div>${c.subs.map((s) => `<span class="pill-sub">${esc(s.name)}</span>`).join('')}</div>` : ''}</div>
+          <input class="input" data-f="cat-plan" data-id="${c.id}" inputmode="decimal" value="${amtStr(c.planned)}" placeholder="₺0"></div>`).join('') || '<p class="muted small">Kategori seçmedin; geri dönüp seçebilirsin.</p>'}
+        <div class="wbox" style="margin-top:12px">Dağıtılmamış (serbest cep)<div class="big" id="w-a">${money(t.unalloc)}</div><span class="small muted">Ay sonunda harcanmazsa birikime aktarabilirsin.</span></div>
+        <button type="button" class="btn secondary" data-act="suggest">✨ Önerilen dağılımı uygula</button>
+        <details style="margin-top:10px"><summary class="small muted">Önerilen dağılım nasıl hesaplanıyor?</summary>
+          <p class="small muted">Kalanın %95'i kategorilerin önemine göre bölünür, %5'i (${money(sp.rest * 0.05)}) beklenmedik giderler için serbest bırakılır.</p>
+          <ul class="list small">${p.categories.map((c) => `<li><div class="main"><div class="title">${esc(c.emoji || '')} ${esc(c.name)}</div><div class="sub">${esc(whyOf(c.name))}</div></div><div class="amt">${money(Math.round(((t.kalan * 0.95) * weightOf(c.name)) / (sum(p.categories, (x) => weightOf(x.name)) || 1) / 50) * 50)}</div></li>`).join('')}</ul></details>`;
+    } else {
+      body = `<ul class="wf">
+          <li><span class="k">Toplam gelir</span><span class="v">${money(t.income)}</span></li>
+          <li class="minus"><span class="k">− Sabit giderler (${p.fixed.length})</span><span class="v">${money(t.fixed)}</span></li>
+          <li class="minus"><span class="k">− Taksitler</span><span class="v">${money(t.taksit)}</span></li>
+          <li class="minus"><span class="k">− Birikim</span><span class="v">${money(p.saving || 0)}</span></li>
+          <li class="total"><span class="k">= Kalan</span><span class="v ${t.kalan < 0 ? 'bad' : ''}">${money(t.kalan)}</span></li>
+          ${p.categories.map((c) => `<li class="sub"><span class="k">${esc(c.emoji || '')} ${esc(c.name)}${(c.subs || []).length ? ` <span class="muted tiny">(${c.subs.map((s) => esc(s.name)).join(', ')})</span>` : ''}</span><span class="v">${money(c.planned)}</span></li>`).join('')}
+          <li class="sub"><span class="k">Dağıtılmamış</span><span class="v ${t.unalloc < 0 ? 'bad' : 'good'}">${money(t.unalloc)}</span></li>
+        </ul>
+        ${t.unalloc < 0 ? `<p class="small bad">⚠︎ Kategorilere kalandan ${money(-t.unalloc)} fazla dağıttın.</p>` : ''}
+        <label class="check" style="margin-top:12px"><input type="checkbox" id="w-apply" ${w.apply ? 'checked' : ''}> Bu aya da uygula (${monthName(now)}) — harcamaların korunur</label>
+        <p class="hint">Plan her yeni ayda otomatik kullanılır. İstediğin zaman Ayarlar → Planım'dan değiştirebilirsin.</p>`;
+    }
+    const html = `<div class="wstep">Adım ${w.step + 1} / ${WSTEPS.length}</div>
+      <div class="wdots">${WSTEPS.map((_, i) => `<i class="${i <= w.step ? 'on' : ''}"></i>`).join('')}</div>
+      ${body}
+      <div class="wnav">${w.step > 0 ? '<button type="button" class="btn secondary" data-nav="-1">Geri</button>' : ''}<button type="button" class="btn" data-nav="1">${w.step === WSTEPS.length - 1 ? 'Planı kaydet' : 'İleri'}</button></div>`;
+    openSheet(WSTEPS[w.step], html, (root) => bindWizard(w, root));
+  }
+  function bindWizard(w, root) {
+    const p = w.plan;
+    const find = (arr, id) => arr.find((x) => x.id === id);
+    const live = () => {
+      const t = wTotals(w), a = $('#w-a', root), b = $('#w-b', root);
+      if (!a) return;
+      const val = w.step === 0 ? t.income : w.step === 2 ? t.fixed + t.taksit : w.step === 3 ? t.kalan : t.unalloc;
+      a.textContent = money(val); a.classList.toggle('bad', val < 0);
+      if (b) b.textContent = money(t.afterFixed);
+      if (w.step === 3) $$('[data-sav]', root).forEach((x) => x.classList.toggle('on', +x.dataset.sav === (p.saving || 0)));
+    };
+    $$('[data-f]', root).forEach((el) => {
+      const ev = el.type === 'checkbox' ? 'change' : 'input';
+      el.addEventListener(ev, () => {
+        const id = el.dataset.id, v = el.value;
+        switch (el.dataset.f) {
+          case 'inc-name': find(p.incomes, id).name = v; break;
+          case 'inc-amt': find(p.incomes, id).amount = amt0(v); break;
+          case 'cat-name': find(p.categories, id).name = v; break;
+          case 'cat-sav': find(p.categories, id).toSavings = el.checked; break;
+          case 'cat-plan': find(p.categories, id).planned = amt0(v); break;
+          case 'fix-emoji': find(p.fixed, id).emoji = v; break;
+          case 'fix-name': find(p.fixed, id).name = v; break;
+          case 'fix-amt': find(p.fixed, id).amount = amt0(v); break;
+          case 'ni-name': find(w.newInst, id).name = v; break;
+          case 'ni-amt': find(w.newInst, id).monthly = amt0(v); break;
+          case 'ni-cnt': find(w.newInst, id).count = parseInt(v, 10) || 0; break;
+          case 'saving': p.saving = amt0(v); break;
+        }
+        live();
+      });
+    });
+    $$('[data-add]', root).forEach((b) => (b.onclick = () => {
+      const k = b.dataset.add;
+      if (k === 'inc') p.incomes.push({ id: uid(), name: '', amount: 0 });
+      if (k === 'fix') p.fixed.push({ id: uid(), name: '', emoji: '📌', amount: 0 });
+      if (k === 'ninst') w.newInst.push({ id: uid(), name: '', monthly: 0, count: 0 });
+      if (k === 'cat') {
+        const n = $('#w-newcat', root).value.trim();
+        if (!n) return toast('Kategori adını yaz');
+        if (!p.categories.some((c) => lower(c.name) === lower(n))) p.categories.push({ id: uid(), name: n, emoji: '•', planned: 0, subs: [], toSavings: false });
+      }
+      drawWizard(w);
+    }));
+    $$('[data-del]', root).forEach((b) => (b.onclick = () => {
+      const id = b.dataset.id, k = b.dataset.del;
+      if (k === 'inc') p.incomes = p.incomes.filter((x) => x.id !== id);
+      if (k === 'fix') p.fixed = p.fixed.filter((x) => x.id !== id);
+      if (k === 'cat') p.categories = p.categories.filter((x) => x.id !== id);
+      if (k === 'inst') w.inst = w.inst.filter((x) => x.id !== id);
+      if (k === 'ninst') w.newInst = w.newInst.filter((x) => x.id !== id);
+      drawWizard(w);
+    }));
+    $$('[data-tog]', root).forEach((b) => (b.onclick = () => {
+      const n = b.dataset.tog;
+      const ex = p.categories.find((c) => lower(c.name) === lower(n));
+      if (ex) p.categories = p.categories.filter((c) => c !== ex);
+      else { const s = SUGGEST_CATS.find((x) => x.name === n); p.categories.push({ id: uid(), name: s.name, emoji: s.emoji, planned: 0, subs: (s.subs || []).map((y) => ({ id: uid(), name: y })), toSavings: !!s.toSavings }); }
+      drawWizard(w);
+    }));
+    $$('[data-addsub]', root).forEach((inp) => {
+      inp.addEventListener('keydown', (ev) => { if (ev.key === 'Enter') { ev.preventDefault(); inp.blur(); } });
+      inp.onchange = () => { const n = inp.value.trim(); if (!n) return; const c = find(p.categories, inp.dataset.addsub); c.subs = c.subs || []; c.subs.push({ id: uid(), name: n }); drawWizard(w); };
+    });
+    $$('[data-delsub]', root).forEach((b) => (b.onclick = () => { const c = find(p.categories, b.dataset.delsub); c.subs = c.subs.filter((s) => s.id !== b.dataset.sid); drawWizard(w); }));
+    $$('[data-addfix]', root).forEach((b) => (b.onclick = () => { p.fixed.push({ id: uid(), name: b.dataset.addfix, emoji: b.dataset.e, amount: 0 }); drawWizard(w); setTimeout(() => { const ins = $$('[data-f="fix-amt"]'); ins.length && ins[ins.length - 1].focus(); }, 60); }));
+    $$('[data-sav]', root).forEach((b) => (b.onclick = () => { p.saving = +b.dataset.sav; drawWizard(w); }));
+    const sg = $('[data-act="suggest"]', root);
+    if (sg) sg.onclick = () => {
+      const t = wTotals(w);
+      const wsum = sum(p.categories, (c) => weightOf(c.name)) || 1;
+      p.categories.forEach((c) => (c.planned = round50((Math.max(0, t.kalan) * 0.95 * weightOf(c.name)) / wsum)));
+      drawWizard(w); toast('Önerilen dağılım uygulandı — istediğini değiştir');
+    };
+    const ap = $('#w-apply', root); if (ap) ap.onchange = () => (w.apply = ap.checked);
+    $$('[data-nav]', root).forEach((b) => (b.onclick = () => {
+      const d = +b.dataset.nav;
+      if (d > 0 && w.step === 0 && !(sum(p.incomes, 'amount') > 0)) return toast('Gelirini gir');
+      if (d > 0 && w.step === WSTEPS.length - 1) return saveWizard(w);
+      w.step = clamp(w.step + d, 0, WSTEPS.length - 1);
+      drawWizard(w);
+    }));
+  }
+  function saveWizard(w) {
+    const now = monthKeyOf();
+    w.newInst.filter((x) => x.name && x.monthly > 0 && x.count > 0).forEach((x) => w.inst.push({ id: uid(), name: x.name.trim(), emoji: '🧾', monthly: x.monthly, count: x.count, start: now }));
+    const p = w.plan;
+    p.incomes = p.incomes.filter((i) => i.name.trim() && i.amount > 0).map((i) => ({ ...i, name: i.name.trim() }));
+    p.fixed = p.fixed.filter((f) => f.name.trim() && f.amount > 0).map((f) => ({ ...f, name: f.name.trim() }));
+    p.categories = p.categories.filter((c) => c.name.trim()).map((c) => ({ ...c, name: c.name.trim() }));
+    p.saving = p.saving || 0;
+    p.reviewed = true;
+    state.plan = p;
+    state.installments = w.inst;
+    if (w.apply) {
+      if (!state.months[now]) buildMonth(now);
+      else { state.months[now].skip = []; }
+      state.ui.month = now;
+    }
+    monthKeys().filter((k) => (w.apply ? k >= now : k > now)).forEach((k) => syncMonth(k, null));
+    save(); closeSheet(); toast('Planın kaydedildi'); location.hash = '#/ozet'; renderView();
+  }
+
+  function suggestionSheet() {
+    const p = state.plan;
+    if (!p) return openWizard('first');
+    const income = sum(p.incomes, 'amount'), fixed = sum(p.fixed, 'amount');
+    const taksit = sum(state.installments.filter((i) => instActive(i, monthKeyOf())), 'monthly');
+    const sp = suggestPlan(income, fixed + taksit, p.categories);
+    openSheet('Önerilen plan', `
+      <p class="muted small" style="margin-top:0">Gelirine ve sabit giderlerine göre hesaplandı. Mevcut planınla yan yana:</p>
+      <div class="table-wrap"><table class="t" style="min-width:0">
+        <thead><tr><th>Kalem</th><th>Senin planın</th><th>Önerilen</th></tr></thead>
+        <tbody>
+          <tr><td>Gelir</td><td>${money(income)}</td><td>${money(income)}</td></tr>
+          <tr><td>Sabit + taksit</td><td>${money(fixed + taksit)}</td><td>${money(fixed + taksit)}</td></tr>
+          <tr><td><b>Birikim</b></td><td>${money(p.saving || 0)}</td><td><b>${money(sp.saving)}</b></td></tr>
+          ${p.categories.map((c) => `<tr><td>${esc(c.emoji || '')} ${esc(c.name)}</td><td>${money(c.planned)}</td><td>${money(sp.alloc[c.id])}</td></tr>`).join('')}
+          <tr><td>Serbest / beklenmedik</td><td>${money(income - fixed - taksit - (p.saving || 0) - sum(p.categories, 'planned'))}</td><td>${money(sp.buffer)}</td></tr>
+        </tbody></table></div>
+      <ul class="list small" style="margin-top:10px">
+        <li><div class="main"><div class="title">Birikim</div><div class="sub">Gelirin %20'si; sabitlerden sonra kalanın en fazla %40'ı (${money(sp.afterFixed)} × %40).</div></div></li>
+        ${p.categories.map((c) => `<li><div class="main"><div class="title">${esc(c.name)}</div><div class="sub">${esc(whyOf(c.name))}</div></div></li>`).join('')}
+        <li><div class="main"><div class="title">Serbest pay</div><div class="sub">Kalanın %5'i beklenmedik giderler için boşta bırakılır.</div></div></li>
+      </ul>
+      <button class="btn" id="apply-sug" style="margin-top:12px">Önerilen tutarları planıma uygula</button>
+      <p class="hint">Uyguladıktan sonra Planım'dan istediğin tutarı değiştirebilirsin. Bu ay ve sonraki aylar güncellenir.</p>`, (root) => {
+      $('#apply-sug', root).onclick = () => {
+        if (!confirm('Birikim ve kategori tutarları önerilen değerlerle değişsin mi?')) return;
+        p.saving = sp.saving;
+        p.categories.forEach((c) => (c.planned = sp.alloc[c.id]));
+        p.reviewed = true;
+        syncFuture(new Set(['saving', ...p.categories.map((c) => c.id)]));
+        save(); closeSheet(); toast('Önerilen plan uygulandı'); renderView();
       };
     });
   }
@@ -921,17 +1579,14 @@
     const last = rows.slice(-12);
     const done = rows.filter((r) => r.phase === 'past');
     const avgScore = done.length ? Math.round(sum(done, 'score') / done.length) : null;
-    const totals = { income: sum(rows, 'income'), planned: sum(rows, 'planned'), spent: sum(rows, 'spent') };
+    const totals = { income: sum(rows, 'income'), planned: sum(rows, 'planned'), spent: sum(rows, 'spent'), saved: sum(rows, 'savingDone') };
     const byName = {};
-    rows.forEach((r) => r.cats.forEach((c) => {
+    rows.forEach((r) => r.cats.filter((c) => c.kind !== 'taksit').forEach((c) => {
       const k = lower(c.name);
       const o = (byName[k] = byName[k] || { name: c.name, emoji: c.emoji, planned: 0, spent: 0, over: 0, months: 0 });
       o.planned += c.planned; o.spent += c.spent; o.months++; if (c.spent > c.planned) o.over++;
     }));
     const catRows = Object.values(byName).sort((a, b) => (b.spent - b.planned) - (a.spent - a.planned));
-    // Gelecek aylara yazılmış taksit yükü
-    const futureInst = monthKeys().filter((k) => k > monthKeyOf()).map((k) => ({ k, t: sum(state.months[k].expenses.filter((e) => e.group), 'amount') })).filter((x) => x.t > 0);
-
     view.innerHTML = `
       <div class="card">
         <div class="card-head"><h3>Planlanan ve harcanan</h3><span class="muted tiny">Son ${last.length} ay</span></div>
@@ -941,21 +1596,21 @@
       <div class="card">
         <div class="card-head"><h3>Finansal başarı</h3>${avgScore != null ? `<span class="chip ${scoreLabel(avgScore)[1]}">Ortalama ${avgScore}</span>` : ''}</div>
         <div class="table-wrap"><table class="t">
-          <thead><tr><th>Ay</th><th>Gelir</th><th>Planlanan</th><th>Harcanan</th><th>Plana göre</th><th>Kalan</th><th>Tasarruf</th><th>Başarı</th></tr></thead>
+          <thead><tr><th>Ay</th><th>Gelir</th><th>Planlanan</th><th>Harcanan</th><th>Plana göre</th><th>Birikime</th><th>Kalan</th><th>Tasarruf</th><th>Başarı</th></tr></thead>
           <tbody>${rows.slice().reverse().map((r) => `<tr class="${r.phase === 'current' ? 'cur' : ''}">
             <td>${monthName(r.key, true)}${r.phase === 'current' ? ' •' : r.phase === 'future' ? ' ◦' : ''}</td>
             <td>${money(r.income)}</td><td>${money(r.planned)}</td><td>${money(r.spent)}</td>
             <td class="${r.vsPlan < 0 ? 'bad' : 'good'}">${signed(r.vsPlan)}</td>
-            <td class="${r.remaining < 0 ? 'bad' : ''}">${money(r.remaining)}</td>
+            <td>${money(r.savingDone)}</td>
+            <td class="${r.cash < 0 ? 'bad' : ''}">${money(r.cash)}</td>
             <td>${pct(r.savingRate)}</td>
             <td><span class="chip ${scoreLabel(r.score)[1]}">${r.score}</span></td></tr>`).join('')}</tbody>
           <tfoot><tr><td>Toplam</td><td>${money(totals.income)}</td><td>${money(totals.planned)}</td><td>${money(totals.spent)}</td>
             <td class="${totals.planned - totals.spent < 0 ? 'bad' : 'good'}">${signed(totals.planned - totals.spent)}</td>
-            <td>${money(totals.income - totals.spent)}</td><td>${totals.income ? pct(((totals.income - totals.spent) / totals.income) * 100) : '—'}</td><td></td></tr></tfoot>
+            <td>${money(totals.saved)}</td><td>${money(totals.income - totals.spent - totals.saved)}</td><td>${totals.income ? pct(((totals.income - totals.spent) / totals.income) * 100) : '—'}</td><td></td></tr></tfoot>
         </table></div>
-        <p class="hint">• devam eden ay, ◦ gelecek ay. Başarı puanı: %50 bütçe içinde kalan kategori oranı + %50 planlanan birikime ulaşma; ekstra harcama kadar puan düşer.</p>
+        <p class="hint">• devam eden ay, ◦ gelecek ay. Başarı puanı: %50 bütçe içinde kalan kalem oranı + %50 planlanan birikime ulaşma; ekstra harcama kadar puan düşer.</p>
       </div>
-      ${futureInst.length ? `<div class="card"><h3>Gelecek taksit yükü</h3><ul class="list">${futureInst.map((x) => `<li><div class="main"><div class="title">${monthName(x.k)}</div></div><div class="amt">${money(x.t)}</div></li>`).join('')}</ul></div>` : ''}
       <div class="card">
         <h3>Kategori karnesi (tüm aylar)</h3>
         <div class="table-wrap"><table class="t" style="min-width:460px">
@@ -966,7 +1621,6 @@
       </div>`;
     bindChart();
   }
-
   function barChart(rows) {
     const W = 640, H = 230, padL = 50, padB = 26, padT = 10;
     const max = Math.max(1, ...rows.map((r) => Math.max(r.planned, r.spent, r.income))) * 1.08;
@@ -1018,16 +1672,14 @@
     const r = state.rates;
     const age = r ? Math.round((Date.now() - r.ts) / 60000) : null;
     const goals = state.savings.goals;
-    // Ay ay birikime aktarılan
-    const transfers = monthKeys().map((k) => ({ k, t: state.months[k].transferred || 0 })).filter((x) => x.t > 0);
+    const transfers = monthKeys().map((k) => ({ k, t: (state.months[k].saving && state.months[k].saving.done) || 0 })).filter((x) => x.t > 0);
     view.innerHTML = `
       <div class="card hero">
         <div class="hero-label">Toplam birikim (bugünkü değer)</div>
         <div class="hero-num">${money(P.value)}</div>
         <div class="hero-sub">Maliyet ${money(P.cost)} · <b class="${P.pl < 0 ? 'bad' : 'good'}">${signed(P.pl)} (${pct(P.plPct)})</b></div>
-        ${r && state.rates.data.USD ? `<div class="hero-sub" style="margin-top:4px">≈ $${nf0.format(P.value / state.rates.data.USD.buy)} · ≈ ${num(P.value / (state.rates.data.GRA?.buy || 1))} gr altın</div>` : ''}
+        ${r && r.data.USD ? `<div class="hero-sub" style="margin-top:4px">≈ $${nf0.format(P.value / r.data.USD.buy)} · ≈ ${num(P.value / (r.data.GRA?.buy || 1))} gr altın</div>` : ''}
       </div>
-
       <div class="section-title">Hedefler</div>
       ${goals.map((g) => {
         const cur = g.mode === 'manual' ? +g.manual || 0 : P.value;
@@ -1035,19 +1687,18 @@
         const leftAmt = Math.max(0, g.target - cur);
         let monthly = '';
         if (g.deadline && leftAmt > 0) {
-          const n = (Number(g.deadline.slice(0, 4)) - new Date().getFullYear()) * 12 + (Number(g.deadline.slice(5, 7)) - (new Date().getMonth() + 1));
+          const n = monthDiff(monthKeyOf(), g.deadline);
           monthly = n > 0 ? `Hedefe ${n} ay var · ayda <b>${money(leftAmt / n)}</b> biriktirmelisin` : '<span class="bad">Hedef tarihi geçti</span>';
         }
         return `<div class="card tap" data-goal="${g.id}">
           <div class="card-head"><h3>${esc(g.emoji || '🎯')} ${esc(g.name)}</h3><b>${pct(p)}</b></div>
           <div class="bar thick"><i class="${p >= 100 ? 'good' : ''}" style="width:${p}%"></i></div>
           <div class="cat-bottom"><span>${money(cur)} / ${money(g.target)}</span><span class="muted">Kalan ${money(leftAmt)}</span></div>
-          ${monthly ? `<div class="small muted" style="margin-top:6px">${monthly}</div>` : ''}
+          ${monthly ? `<div class="small muted" style="margin-top:6px">${monthly}${state.plan && state.plan.saving ? ` · planındaki aylık birikim ${money(state.plan.saving)}` : ''}</div>` : ''}
           ${p >= 100 ? '<div class="small good" style="margin-top:6px">🎉 Hedefe ulaştın!</div>' : ''}
         </div>`;
       }).join('')}
       <button class="btn secondary" id="add-goal">+ Hedef ekle</button>
-
       <div class="section-title">Varlıklarım</div>
       <div class="card" style="padding:4px 16px">
         <ul class="list">${P.rows.map((h) => {
@@ -1061,7 +1712,6 @@
       </div>
       <button class="btn" id="add-h">+ Varlık ekle</button>
       ${transfers.length ? `<p class="hint">Bütçeden aktarılan: ${transfers.map((x) => `${monthName(x.k, true)} ${money(x.t)}`).join(' · ')}</p>` : ''}
-
       <div class="section-title">Güncel kurlar</div>
       <div class="card">
         <div class="card-head"><span class="small muted">${ratesLoading ? 'Güncelleniyor…' : r ? `${esc(r.source)} · ${age < 1 ? 'az önce' : age < 60 ? age + ' dk önce' : Math.round(age / 60) + ' sa önce'}` : 'Kur bilgisi yok'}</span>
@@ -1075,9 +1725,8 @@
             ${d && !o ? `<div class="tiny muted">Satış ${money2(d.sell)} · <span class="${d.change < 0 ? 'bad' : 'good'}">${pct(d.change)}</span></div>` : ''}
           </div>`;
         }).join('')}</div>
-        <p class="hint">Kaynak öncelikle Harem Altın; ulaşılamazsa Kapalıçarşı verisi kullanılır. Değerleme bozdurma (alış) fiyatıyla yapılır — satsan eline geçecek tutar. Sayfa açıkken kurlar her dakika yenilenir. Bir kura dokunup manuel fiyat girebilirsin.</p>
+        <p class="hint">Kaynak öncelikle Harem Altın; ulaşılamazsa Kapalıçarşı verisi. Değerleme bozdurma (alış) fiyatıyla yapılır. Sayfa açıkken kurlar her dakika yenilenir. Bir kura dokunup manuel fiyat girebilirsin.</p>
       </div>`;
-
     $('#add-h').onclick = () => holdingForm();
     $$('[data-h]', view).forEach((li) => (li.onclick = () => holdingForm(state.savings.holdings.find((h) => h.id === li.dataset.h))));
     $('#add-goal').onclick = () => goalForm();
@@ -1110,8 +1759,7 @@
         $('#qty-l', root).textContent = a.unit === 'adet' ? 'Adet' : a.unit === 'gram' ? 'Gram' : `Miktar (${a.unit})`;
         if (f.type.value === 'TRY') { f.buyPrice.value = '1'; f.buyPrice.readOnly = true; $('#now-p', root).textContent = ''; return; }
         f.buyPrice.readOnly = false;
-        const d = state.rates && state.rates.data;
-        const r = d && (d[a.key] || (a.alt && d[a.alt]));
+        const r = rateOf(f.type.value);
         $('#now-p', root).innerHTML = r ? `Şu an satış ${money2(r.sell)} · bozdurma ${money2(r.buy)} <button type="button" class="link-btn" id="use-p">Satış fiyatını yaz</button>` : 'Güncel fiyat yok';
         const u = $('#use-p', root); if (u) u.onclick = () => { f.buyPrice.value = amtStr(Math.round(r.sell * 100) / 100); };
       };
@@ -1144,7 +1792,7 @@
         </div>
         <div class="field"><label>İlerleme neye göre hesaplansın?</label>
           <select class="input" name="mode"><option value="all" ${x.mode === 'all' ? 'selected' : ''}>Tüm birikimimin güncel değeri</option><option value="manual" ${x.mode === 'manual' ? 'selected' : ''}>Kendi girdiğim tutar</option></select></div>
-        <div class="field" id="man"><label>Bu hedef için biriken (₺)</label><input class="input" name="manual" inputmode="decimal" value="${x.manual ? amtStr(x.manual) : ''}"></div>
+        <div class="field" id="man"><label>Bu hedef için biriken (₺)</label><input class="input" name="manual" inputmode="decimal" value="${amtStr(x.manual)}"></div>
         <button class="btn" type="submit">Kaydet</button>
         ${isNew ? '' : '<div class="btn-row"><button class="btn danger" type="button" id="del">Sil</button></div>'}
       </form>`, (root) => {
@@ -1201,7 +1849,23 @@
   // ---------- Sayfa: Ayarlar ----------
   function renderAyarlar() {
     const bytes = new Blob([localStorage.getItem(STORE_KEY) || '']).size;
+    const p = state.plan;
+    const pt = p ? { income: sum(p.incomes, 'amount'), fixed: sum(p.fixed, 'amount'), taksit: sum(state.installments.filter((i) => instActive(i, monthKeyOf())), 'monthly'), alloc: sum(p.categories, 'planned') } : null;
     view.innerHTML = `
+      <div class="card">
+        <div class="card-head"><h3>🧭 Planım</h3>${p ? `<span class="chip ${p.reviewed ? 'good' : 'warn'}">${p.reviewed ? 'Hazır' : 'Gözden geçir'}</span>` : ''}</div>
+        ${p ? `<ul class="wf">
+          <li><span class="k">Gelir (${p.incomes.length})</span><span class="v">${money(pt.income)}</span></li>
+          <li class="minus"><span class="k">− Sabit (${p.fixed.length}) + taksit</span><span class="v">${money(pt.fixed + pt.taksit)}</span></li>
+          <li class="minus"><span class="k">− Birikim</span><span class="v">${money(p.saving || 0)}</span></li>
+          <li class="total"><span class="k">= Kalan</span><span class="v">${money(pt.income - pt.fixed - pt.taksit - (p.saving || 0))}</span></li>
+          <li class="sub"><span class="k">${p.categories.length} kategoriye ayrılan</span><span class="v">${money(pt.alloc)}</span></li>
+        </ul>
+        <button class="btn" id="plan-edit" style="margin-top:10px">Planımı düzenle</button>
+        <div class="btn-row"><button class="btn secondary" id="plan-sug">Önerilen plan</button><button class="btn secondary" id="plan-new">Sıfırdan oluştur</button></div>
+        <p class="hint">Plan her yeni ayda otomatik kullanılır. Değişiklikler bu ay ve sonraki aylara uygulanır; geçmiş aylar korunur.</p>`
+        : `<p class="small muted" style="margin-top:0">Henüz planın yok.</p><button class="btn" id="plan-new">Planımı oluştur</button>`}
+      </div>
       <div class="card">
         <h3>Profil</h3>
         <div class="field"><label>Adın</label><input class="input" id="name" value="${esc(state.user.name)}"></div>
@@ -1230,6 +1894,9 @@
         <button class="btn danger" id="reset">Tüm verileri sil</button>
       </div>
       <p class="hint" style="text-align:center">Finansım · üyelik yok · verilerin hiçbir sunucuya gönderilmez (yalnızca kur bilgisi çekilir)</p>`;
+    const pe = $('#plan-edit'); if (pe) pe.onclick = () => openWizard('edit');
+    const ps = $('#plan-sug'); if (ps) ps.onclick = suggestionSheet;
+    $('#plan-new').onclick = () => { if (!p || confirm('Mevcut planın yerine sıfırdan yeni bir plan oluşturulsun mu? (Geçmiş ayların ve harcamaların korunur)')) openWizard('new'); };
     $('#name').onchange = (e) => { state.user.name = e.target.value.trim() || state.user.name; save(); updateHeader(); };
     $$('#theme button').forEach((b) => (b.onclick = () => { state.settings.theme = b.dataset.v; save(); applyTheme(); renderAyarlar(); }));
     $('#pin-set').onclick = () => openSheet('PIN belirle', `
@@ -1258,13 +1925,13 @@
     };
     $('#code').onclick = () => openSheet('Veri kodu yapıştır', `
       <form id="f"><div class="field"><textarea class="input" name="c" rows="5" placeholder="https://…#veri=… ya da sadece kod"></textarea></div>
-      <p class="hint">Koddaki ayın planı ve harcamaları eklenir; aynı ay varsa üzerine yazılır.</p>
+      <p class="hint">Koddaki plan ve o ayın harcamaları yüklenir; aynı ay varsa üzerine yazılır.</p>
       <button class="btn" type="submit">Yükle</button></form>`, (root) => {
       $('#f', root).onsubmit = (ev) => {
         ev.preventDefault();
         const d = decodeCode(ev.target.c.value);
         if (!d) return toast('Kod okunamadı');
-        if (state.months[d.m] && !confirm(`${monthName(d.m)} zaten var, üzerine yazılsın mı?`)) return;
+        if (state.months[d.m] && !confirm(`${monthName(d.m)} zaten var; plan ve bu ayın harcamaları koddakiyle değişsin mi?`)) return;
         applyCode(d); save(); closeSheet(); toast(`${monthName(d.m)} verileri yüklendi`); location.hash = '#/ozet';
       };
     });
@@ -1292,7 +1959,7 @@
     ob.innerHTML = `<div class="card">
       <div style="font-size:42px">💰</div>
       <h1>Finansım'a hoş geldin</h1>
-      <p class="muted" style="margin-top:0">Üyelik yok. Her şey yalnızca bu cihazda saklanır.</p>
+      <p class="muted" style="margin-top:0">Üyelik yok. Her şey yalnızca bu cihazda saklanır. Adını yaz, sonra birkaç adımda planını birlikte kuralım.</p>
       <form id="ob-f">
         <div class="field"><label>Adın</label><input class="input" name="name" placeholder="Adını yaz" required autocomplete="given-name"></div>
         ${pendingCode ? `<label class="check"><input type="checkbox" name="usecode" checked> ${monthName(pendingCode.m)} planımı ve harcamalarımı yükle (linkten geldi)</label>`
@@ -1304,24 +1971,23 @@
       const f = e.target;
       state = freshState(f.name.value.trim());
       const code = pendingCode && f.usecode && f.usecode.checked ? pendingCode : f.code ? decodeCode(f.code.value) : null;
-      if (f.code && f.code.value.trim() && !code) return toast('Veri kodu okunamadı');
+      if (f.code && f.code.value.trim() && !code) { state = null; return toast('Veri kodu okunamadı'); }
       if (code) applyCode(code);
       pendingCode = null; unlocked = true;
       autoRollover();
       save(); ob.remove(); $('#app').hidden = false; location.hash = '#/ozet'; render(); refreshRates();
+      if (!state.plan) setTimeout(() => openWizard('first'), 300);
     };
   }
 
-  // Yeni aya girildiğinde planı önceki aydan otomatik kopyala
   function autoRollover() {
     const now = monthKeyOf();
     if (!state || state.months[now]) return;
-    const prev = monthKeys().filter((k) => k < now).pop();
-    if (!prev) return;
+    if (!state.plan && !monthKeys().length) return;
     ensureMonth(now);
     state.ui.month = now;
     save();
-    setTimeout(() => toast(`${monthName(now)} planı ${monthName(prev)} ayından kopyalandı`), 600);
+    setTimeout(() => toast(`${monthName(now)} planından oluşturuldu`), 600);
   }
 
   // ---------- Yönlendirme ----------
@@ -1329,9 +1995,9 @@
     const r = route();
     const h = new Date().getHours();
     const greet = h < 6 ? 'İyi geceler' : h < 12 ? 'Günaydın' : h < 18 ? 'Merhaba' : 'İyi akşamlar';
-    const titles = { birikim: 'Birikimim', ayarlar: 'Ayarlar', rapor: 'Raporlar', islem: 'Giriş / Çıkış' };
+    const titles = { birikim: 'Birikimim', ayarlar: 'Ayarlar', rapor: 'Raporlar', islem: 'Giriş / Çıkış', odemeler: 'Ödemeler' };
     $('#hello').textContent = titles[r] || `${greet}, ${state.user.name}`;
-    $('#month-switch').hidden = !(r === 'ozet' || r === 'islem');
+    $('#month-switch').hidden = !(r === 'ozet' || r === 'islem' || r === 'odemeler');
     $('#m-label').textContent = monthName(curMonthKey());
     $$('#tabbar a').forEach((a) => a.classList.toggle('active', a.dataset.tab === r));
     $('#fab').hidden = !(r === 'ozet' || r === 'birikim');
@@ -1340,7 +2006,7 @@
   function renderView() {
     hideTip();
     updateHeader();
-    ({ ozet: renderOzet, islem: renderIslem, rapor: renderRapor, birikim: renderBirikim, ayarlar: renderAyarlar }[route()] || renderOzet)();
+    ({ ozet: renderOzet, islem: renderIslem, odemeler: renderOdemeler, rapor: renderRapor, birikim: renderBirikim, ayarlar: renderAyarlar }[route()] || renderOzet)();
   }
   function render() {
     applyTheme();
@@ -1348,7 +2014,7 @@
     if (state.settings.pinHash && !unlocked) return renderLock();
     if (pendingCode) {
       const d = pendingCode; pendingCode = null;
-      if (confirm(`Linkteki ${monthName(d.m)} verileri yüklensin mi?${state.months[d.m] ? ' (Bu ay zaten var, üzerine yazılır.)' : ''}`)) { applyCode(d); save(); toast('Veriler yüklendi'); }
+      if (confirm(`Linkteki ${monthName(d.m)} planı ve verileri yüklensin mi?${state.months[d.m] ? ' (Bu ay zaten var, üzerine yazılır.)' : ''}`)) { applyCode(d); save(); toast('Veriler yüklendi'); }
     }
     $('#app').hidden = false;
     renderView();
@@ -1362,13 +2028,13 @@
     openSheet('Ay seç', `<ul class="list">${keys.map((k) => {
       const m = state.months[k];
       const s = m ? calc(m, k) : null;
-      return `<li class="tap" data-k="${k}"><div class="main"><div class="title">${monthName(k)}${k === monthKeyOf() ? ' · bu ay' : ''}</div><div class="sub">${s ? `Harcanan ${money(s.spent)} / Gelir ${money(s.income)}` : 'Plan yok'}</div></div>${k === curMonthKey() ? '<span class="chip info">Seçili</span>' : ''}</li>`;
+      return `<li class="tap" data-k="${k}"><div class="main"><div class="title">${monthName(k)}${k === monthKeyOf() ? ' · bu ay' : ''}</div><div class="sub">${s ? `Harcanan ${money(s.spent)} / Gelir ${money(s.income)}` : 'Henüz açılmadı'}</div></div>${k === curMonthKey() ? '<span class="chip info">Seçili</span>' : ''}</li>`;
     }).join('')}</ul>`, (root) => $$('[data-k]', root).forEach((li) => (li.onclick = () => { state.ui.month = li.dataset.k; save(); closeSheet(); renderView(); })));
   };
   $('#btn-settings').onclick = () => (location.hash = '#/ayarlar');
   $('#fab').onclick = () => (route() === 'birikim' ? holdingForm() : expenseForm());
 
-  if (state) { state = migrate(state); state.ui.cat = null; autoRollover(); }
+  if (state) { state = migrate(state); state.ui.cat = null; save(); autoRollover(); }
   render();
   if (state) refreshRates();
   document.addEventListener('visibilitychange', () => { if (!document.hidden && state) refreshRates({ silent: true }); });

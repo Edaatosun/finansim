@@ -112,7 +112,7 @@ a { color: var(--accent); }
 /* Tab bar */
 .tabbar {
   position: fixed; left: 0; right: 0; bottom: 0; z-index: 30;
-  display: grid; grid-template-columns: repeat(4, 1fr);
+  display: grid; grid-template-columns: repeat(5, 1fr);
   height: calc(var(--tabbar-h) + var(--safe-b)); padding-bottom: var(--safe-b);
   background: color-mix(in srgb, var(--surface) 92%, transparent);
   backdrop-filter: saturate(1.6) blur(14px);
@@ -336,3 +336,51 @@ svg.chart .hit { fill: transparent; cursor: pointer; }
 .cat-pick.on { border-color: var(--accent); background: var(--accent-soft); }
 details summary { cursor: pointer; }
 textarea.input { resize: vertical; font-size: 15px; }
+
+/* v3 — plan sihirbazı, şelale, ödemeler */
+.wf { list-style: none; margin: 0; padding: 0; }
+.wf li { display: flex; justify-content: space-between; padding: 7px 0; font-size: 15px; }
+.wf li .k { color: var(--text-2); }
+.wf li.minus .v { color: var(--text-2); }
+.wf li.total { border-top: 1.5px solid var(--text); margin-top: 4px; padding-top: 10px; font-weight: 700; font-size: 17px; }
+.wf li.total .k { color: var(--text); }
+.wf li.sub { font-size: 14px; }
+.subline { font-size: 12.5px; color: var(--text-3); margin-top: 5px; line-height: 1.5; }
+.banner { background: var(--accent-soft); color: var(--text); border-radius: var(--radius); padding: 14px 16px; margin-bottom: 14px; display: flex; gap: 12px; align-items: center; }
+.banner .t { flex: 1; font-size: 14px; }
+.banner .btn { width: auto; flex: none; }
+
+.wstep { font-size: 12px; font-weight: 600; color: var(--accent); text-transform: uppercase; letter-spacing: .05em; margin-bottom: 2px; }
+.wdots { display: flex; gap: 5px; margin: 4px 0 14px; }
+.wdots i { flex: 1; height: 4px; border-radius: 2px; background: var(--surface-2); }
+.wdots i.on { background: var(--accent); }
+.wrow { display: grid; grid-template-columns: 1fr 112px 36px; gap: 8px; margin-bottom: 8px; align-items: center; }
+.wrow.three { grid-template-columns: 1fr 96px 70px 36px; }
+.wrow.emoji { grid-template-columns: 50px 1fr 104px 36px; }
+.wrow .input { padding: 10px; }
+.x { border: 0; background: var(--surface-2); color: var(--text-3); width: 36px; height: 36px; border-radius: 10px; font-size: 14px; }
+.x:active { background: var(--bad-soft); color: var(--bad); }
+.chips { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 12px; }
+.chips button { border: 1.5px solid var(--line); background: var(--surface); padding: 7px 12px; border-radius: 999px; font-size: 14px; font-weight: 600; color: var(--text-2); }
+.chips button.on { border-color: var(--accent); background: var(--accent-soft); color: var(--text); }
+.wcat { background: var(--surface-2); border-radius: 12px; padding: 10px 12px; margin-bottom: 8px; }
+.wcat-h { display: flex; align-items: center; gap: 8px; }
+.wcat-h .input { flex: 1; background: var(--surface); padding: 8px 10px; }
+.subs { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; align-items: center; }
+.subs .chip { padding: 4px 4px 4px 10px; }
+.x-s { border: 0; background: transparent; color: var(--text-3); font-size: 12px; padding: 0 4px; }
+.sub-in { width: 140px !important; padding: 6px 10px !important; font-size: 14px !important; background: var(--surface) !important; }
+.check.slim { background: transparent; padding: 6px 0 0; margin: 0; font-size: 13px; }
+.wopt { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-bottom: 12px; }
+.wopt button { border: 1.5px solid var(--line); background: var(--surface); border-radius: 12px; padding: 10px; text-align: left; }
+.wopt button b { display: block; font-size: 16px; }
+.wopt button span { font-size: 12px; color: var(--text-3); }
+.wopt button.on { border-color: var(--accent); background: var(--accent-soft); }
+.wbox { background: var(--surface-2); border-radius: 12px; padding: 12px 14px; margin-bottom: 12px; }
+.wbox .big { font-size: 26px; font-weight: 700; letter-spacing: -.02em; }
+.wnav { position: sticky; bottom: 0; display: flex; gap: 10px; padding: 12px 0 4px; background: var(--surface); margin-top: 8px; }
+.wnav .btn { flex: 1; }
+.dist-row { display: grid; grid-template-columns: 1fr 120px; gap: 10px; align-items: center; padding: 8px 0; border-top: 1px solid var(--line); }
+.dist-row:first-of-type { border-top: 0; }
+.dist-row .input { padding: 10px; text-align: right; }
+.pill-sub { display: inline-block; font-size: 11.5px; background: var(--surface-2); color: var(--text-2); border-radius: 999px; padding: 2px 8px; margin: 3px 4px 0 0; }
