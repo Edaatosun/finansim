@@ -29,6 +29,27 @@
   const amtStr = (n) => (n === '' || n == null || n === 0 ? '' : String(n).replace('.', ','));
   const round50 = (n) => Math.max(0, Math.round(n / 50) * 50);
 
+  // ---------- Düzenli birikim & hedef türleri ----------
+  const SAVING_TYPES = ['CEYREK', 'GRAM', 'YARIM', 'TAM', 'CUMHURIYET', 'USD', 'EUR', 'GUMUS', 'TRY'];
+  const GOAL_KINDS = {
+    car: ['🚗', 'Araba', 'Arabana kavuştun! 🎉'], house: ['🏠', 'Ev', 'Evine kavuştun! 🎉'], debt: ['🔓', 'Borç bitirme', 'Borçsuzsun! 🎉'],
+    travel: ['🏖️', 'Tatil', 'Tatil seni bekliyor! 🎉'], wedding: ['💍', 'Düğün', 'Hedefe ulaştın! 🎉'], edu: ['🎓', 'Eğitim', 'Hedefe ulaştın! 🎉'],
+    emergency: ['🛟', 'Acil durum fonu', 'Güvenlik ağın hazır! 🎉'], other: ['🎯', 'Diğer', 'Hedefe ulaştın! 🎉'],
+  };
+  // Planlanan birikim kaleminin bugünkü tahmini TL karşılığı (satış fiyatıyla)
+  function estItem(i) {
+    if (i.type === 'TRY') return +i.amount || 0;
+    const r = rateOf(i.type);
+    return (+i.qty || 0) * (r ? r.sell : +i.lastPrice || 0);
+  }
+  const planSavingTotal = (p) => sum((p && p.savingItems) || [], estItem);
+  function itemLabel(i) {
+    if (i.type === 'TRY') return `${money(i.amount)} TL`;
+    const a = ASSETS[i.type];
+    if (!a) return i.type;
+    return a.unit === 'adet' ? `${num(i.qty)} ${a.name}` : a.unit === 'gram' ? `${num(i.qty)} gr ${a.name}` : `${num(i.qty)} ${a.unit} (${a.name})`;
+  }
+
   function parseAmount(v) {
     if (typeof v === 'number') return v;
     let s = String(v || '').replace(/[₺\s]|TL/gi, '');
@@ -135,7 +156,21 @@
         }
       }
     }
-    s.version = 3;
+    // v3 → v4: tek tutarlı birikim yerine düzenli birikim kalemleri (ör. her ay 1 çeyrek)
+    let convertedId = null;
+    if (s.plan && !s.plan.savingItems) {
+      s.plan.savingItems = [];
+      if (s.plan.saving > 0) { convertedId = uid(); s.plan.savingItems.push({ id: convertedId, type: 'TRY', amount: s.plan.saving, qty: 0, goalId: null }); }
+    }
+    if (s.plan) delete s.plan.saving;
+    for (const m of Object.values(s.months)) {
+      if (m.saving.items) continue;
+      const planned = +m.saving.planned || 0;
+      m.saving.items = planned > 0 ? [{ id: uid(), tplId: convertedId || undefined, type: 'TRY', amount: planned, qty: 0, goalId: null, done: (m.saving.done || 0) >= planned, doneAmount: (m.saving.done || 0) >= planned ? planned : 0 }] : [];
+      delete m.saving.planned;
+    }
+    s.savings.goals.forEach((g) => { g.kind = g.kind || 'other'; g.mode = g.mode || 'all'; });
+    s.version = 4;
     return s;
   }
 
@@ -189,13 +224,21 @@
     });
     m.categories = m.categories.filter((c) => !c.instId || state.installments.some((i) => i.id === c.instId) || hasEx(c));
 
-    m.saving = m.saving || { planned: 0, done: 0 };
-    if (want('saving')) m.saving.planned = p.saving || 0;
+    m.saving = m.saving || { done: 0, items: [] };
+    m.saving.items = m.saving.items || [];
+    (p.savingItems || []).forEach((t) => {
+      if (m.skip.includes(t.id)) return;
+      const x = m.saving.items.find((i) => i.tplId === t.id);
+      const f = { type: t.type, qty: t.qty, amount: t.amount, goalId: t.goalId || null, lastPrice: t.lastPrice };
+      if (!x) m.saving.items.push({ id: uid(), tplId: t.id, ...f, done: false, doneAmount: 0 });
+      else if (!x.done && want(t.id)) Object.assign(x, f);
+    });
+    m.saving.items = m.saving.items.filter((i) => i.done || !i.tplId || (p.savingItems || []).some((t) => t.id === i.tplId));
   }
   const syncFuture = (only) => monthKeys().filter((k) => k >= monthKeyOf()).forEach((k) => syncMonth(k, only));
 
   function buildMonth(k) {
-    state.months[k] = { incomes: [], categories: [], expenses: [], saving: { planned: 0, done: 0 }, skip: [] };
+    state.months[k] = { incomes: [], categories: [], expenses: [], saving: { done: 0, items: [] }, skip: [] };
     if (state.plan) syncMonth(k, null);
     return state.months[k];
   }
@@ -207,7 +250,7 @@
     state.months[k] = {
       incomes: src ? src.incomes.map((i) => ({ ...i, id: uid() })) : [],
       categories: src ? src.categories.map((c) => ({ ...c, id: uid() })) : [],
-      expenses: [], saving: { planned: src ? src.saving.planned : 0, done: 0 }, skip: [],
+      expenses: [], saving: { done: 0, items: src ? (src.saving.items || []).map((i) => ({ ...i, id: uid(), done: false, doneAmount: 0, holdingId: undefined })) : [] }, skip: [],
     };
     return state.months[k];
   }
@@ -227,8 +270,8 @@
     (d.h || []).forEach(([type, qty, buyPrice, date]) => {
       if (!state.savings.holdings.some((h) => h.type === type && h.qty === qty && h.buyPrice === buyPrice && h.date === date)) state.savings.holdings.push({ id: uid(), type, qty, buyPrice, date, note: '' });
     });
-    (d.g || []).forEach(([name, emoji, target, deadline]) => {
-      if (!state.savings.goals.some((g) => lower(g.name) === lower(name))) state.savings.goals.push({ id: uid(), name, emoji, target, deadline, mode: 'all', manual: 0 });
+    (d.g || []).forEach(([name, emoji, target, deadline, kind]) => {
+      if (!state.savings.goals.some((g) => lower(g.name) === lower(name))) state.savings.goals.push({ id: uid(), name, emoji, target, deadline, kind: kind || 'other', mode: 'all', manual: 0 });
     });
   }
   function applyCode(d) {
@@ -238,8 +281,12 @@
         incomes: p.i.map(([name, amount]) => ({ id: uid(), name, amount })),
         fixed: p.f.map(([name, amount, emoji]) => ({ id: uid(), name, amount, emoji })),
         categories: p.c.map(([name, emoji, planned, subs, toSav]) => ({ id: uid(), name, emoji, planned, subs: (subs || []).map((n) => ({ id: uid(), name: n })), toSavings: !!toSav })),
-        saving: p.s || 0, reviewed: false,
+        savingItems: [], reviewed: false,
       };
+      addHoldingsGoals(d);
+      const goalId = (n) => (n ? (state.savings.goals.find((g) => lower(g.name) === lower(n)) || {}).id || null : null);
+      (p.si || []).forEach(([type, qty, amount, goal, lastPrice]) => state.plan.savingItems.push({ id: uid(), type, qty, amount, goalId: goalId(goal), lastPrice }));
+      if (p.s > 0) state.plan.savingItems.push({ id: uid(), type: 'TRY', amount: p.s, qty: 0, goalId: null });
       (d.t || []).forEach(([name, emoji, monthly, count, start]) => state.installments.push({ id: uid(), name, emoji, monthly, count, start }));
       delete state.months[d.m];
       const m = buildMonth(d.m);
@@ -249,7 +296,6 @@
         const s = sub ? (c.subs || []).find((x) => lower(x.name) === lower(sub)) : null;
         m.expenses.push({ id: uid(), catId: c.id, subId: s ? s.id : undefined, desc, amount, date: `${d.m}-${pad(day)}`, extra: false });
       });
-      addHoldingsGoals(d);
       syncFuture(null);
       state.ui.month = d.m;
       return;
@@ -260,7 +306,7 @@
       incomes: (d.i || []).map(([name, amount]) => ({ id: uid(), name, amount })),
       categories: cats,
       expenses: (d.e || []).map(([ci, desc, amount, day]) => ({ id: uid(), catId: cats[ci].id, desc, amount, date: `${d.m}-${pad(day)}`, extra: false })),
-      saving: { planned: 0, done: 0 }, skip: [],
+      saving: { done: 0, items: [] }, skip: [],
     };
     addHoldingsGoals(d);
     if (!state.plan) { state = migrate(state); }
@@ -301,7 +347,10 @@
     const fixedCats = cats.filter((c) => c.kind === 'fixed'), instCats = cats.filter((c) => c.kind === 'taksit'), varCats = cats.filter((c) => c.kind === 'var');
     const fixedPlan = sum(fixedCats, 'planned'), instPlan = sum(instCats, 'planned');
     const committed = fixedPlan + instPlan;
-    const savingPlanned = (m.saving && m.saving.planned) || 0, savingDone = (m.saving && m.saving.done) || 0;
+    const sItems = (m.saving && m.saving.items) || [];
+    const savingPlanned = sum(sItems, (i) => (i.done ? i.doneAmount : estItem(i)));
+    const savingDone = (m.saving && m.saving.done) || 0;
+    const savingLeft = sum(sItems.filter((i) => !i.done), estItem);
     const kalan = income - committed - savingPlanned;
     const allocated = sum(varCats, 'planned');
     const unalloc = kalan - allocated;
@@ -334,7 +383,11 @@
     const pendingFixed = sum(cats.filter(isCommit), (c) => Math.max(0, c.diff));
     const daysLeft = phase === 'current' ? daysInMonth(key) - new Date().getDate() + 1 : 0;
     const toSavingsLeft = sum(varCats.filter((c) => c.toSavings), (c) => Math.max(0, c.diff));
-    return { income, cats, fixedCats, instCats, varCats, fixedPlan, instPlan, committed, savingPlanned, savingDone, kalan, allocated, unalloc, planned, spent, phase, saved, openBudget, lost, extra, inPlan, overrun, plannedSaving, remaining, cash, vsPlan, score, savingRate, varLeft, pendingFixed, daysLeft, withinCount, plannedCount: plannedCats.length, toSavingsLeft };
+    // Bütçe planına göre bu ay birikime ayrılabilecek en fazla tutar:
+    // gelir − şimdiye kadarki harcama − ödenmemiş sabit/taksit − kategorilerde kalan bütçe − zaten aktarılan
+    const savingRoom = income - spent - pendingFixed - varLeft - savingDone;
+    const savingShort = phase !== 'past' ? Math.max(0, Math.round(savingLeft - Math.max(0, savingRoom))) : 0;
+    return { income, cats, sItems, savingLeft, savingRoom, savingShort, fixedCats, instCats, varCats, fixedPlan, instPlan, committed, savingPlanned, savingDone, kalan, allocated, unalloc, planned, spent, phase, saved, openBudget, lost, extra, inPlan, overrun, plannedSaving, remaining, cash, vsPlan, score, savingRate, varLeft, pendingFixed, daysLeft, withinCount, plannedCount: plannedCats.length, toSavingsLeft };
   }
   function scoreLabel(s) {
     if (s >= 85) return ['Mükemmel', 'good'];
@@ -526,6 +579,77 @@
     return { rows, cost, value, pl: value - cost, plPct: cost ? ((value - cost) / cost) * 100 : 0 };
   }
 
+  // ---------- Hedef ilerlemesi ve tahmin ----------
+  function goalCurrent(g, P) {
+    if (g.mode === 'manual') return +g.manual || 0;
+    if (g.mode === 'linked') return sum(P.rows.filter((h) => h.goalId === g.id), 'value');
+    return P.value;
+  }
+  // Bu hedefe her ay planlanan katkı (düzenli birikim kalemlerinden)
+  function goalMonthly(g) {
+    const items = (state.plan && state.plan.savingItems) || [];
+    return sum(g.mode === 'linked' ? items.filter((i) => i.goalId === g.id) : items, estItem);
+  }
+  function goalForecast(g, P) {
+    const cur = goalCurrent(g, P);
+    const left = Math.max(0, g.target - cur);
+    const pctDone = g.target ? clamp((cur / g.target) * 100, 0, 100) : 0;
+    const now = monthKeyOf();
+    const monthly = goalMonthly(g);
+    const out = { cur, left, pctDone, monthly, monthsToDeadline: g.deadline ? monthDiff(now, g.deadline) : null };
+    if (left <= 0) return { ...out, done: true };
+    if (!(monthly > 0)) return { ...out, noPlan: true };
+    // Bu ayın planlanan birikimi yapıldıysa sayım gelecek aydan başlar
+    const m = state.months[now];
+    const thisDone = m && m.saving.items.length && m.saving.items.every((i) => i.done);
+    const startK = thisDone ? addMonth(now, 1) : now;
+    const need = Math.ceil(left / monthly);
+    const eta = addMonth(startK, need - 1);
+    const late = g.deadline ? monthDiff(g.deadline, eta) : 0;
+    const monthsAvail = g.deadline ? monthDiff(startK, g.deadline) + 1 : null;
+    const needMonthly = monthsAvail > 0 ? left / monthsAvail : null;
+    return { ...out, eta, late, needMonthly, startK };
+  }
+  function goalMessage(p) {
+    if (p >= 100) return 'Hedefe ulaştın!';
+    if (p >= 75) return 'Son çeyrek — hedef göründü!';
+    if (p >= 50) return 'Yarıyı geçtin — artık geri dönüş yok!';
+    if (p >= 25) return '%25\'i geçtin — çeyrek yol tamam!';
+    return 'Yolun başındasın; her ay bir adım daha.';
+  }
+  function goalTrack(g, F) {
+    const kind = GOAL_KINDS[g.kind] || GOAL_KINDS.other;
+    const icon = g.emoji || kind[0];
+    const p = F.pctDone;
+    return `<div class="track">
+        <div class="track-bar"><i style="width:${p}%"></i>
+          ${[25, 50, 75].map((x) => `<span class="ms ${p >= x ? 'on' : ''}" style="left:${x}%"></span>`).join('')}
+          <span class="runner" style="left:${clamp(p, 3, 97)}%">${Math.round(p)}%</span>
+        </div>
+        <div class="track-end ${p >= 100 ? 'done' : ''}" aria-hidden="true">${esc(icon)}</div>
+      </div>
+      <div class="track-labels"><span>%0</span><span>%25</span><span>%50</span><span>%75</span><span>%100</span></div>`;
+  }
+  function goalText(g, F) {
+    const kind = GOAL_KINDS[g.kind] || GOAL_KINDS.other;
+    const lines = [];
+    lines.push(`<b>${F.done ? kind[2] : goalMessage(F.pctDone)}</b> %${Math.round(F.pctDone)} tamamlandı.`);
+    lines.push(`${money(F.cur)} birikti${F.left > 0 ? `, ${money(F.left)} kaldı` : ''}.`);
+    if (g.deadline) {
+      const n = F.monthsToDeadline;
+      lines.push(n > 0 ? `Hedef ay: ${monthName(g.deadline)} — ${n} ay kaldı.` : n === 0 ? `Hedef ay: bu ay.` : `Hedef ay ${monthName(g.deadline)} geçti.`);
+    }
+    let warn = '';
+    if (!F.done) {
+      if (F.noPlan) warn = `Planında bu hedefe düzenli birikim yok. Planım → Birikim adımından ekle.`;
+      else {
+        lines.push(`Ayda ~${money(F.monthly)} birikimle tahmini ulaşma: <b>${monthName(F.eta)}</b>.`);
+        if (F.late > 0) warn = `Bu planla hedefe ${F.late} ay geç ulaşıyorsun. Zamanında ulaşmak için ayda ${money(F.needMonthly)} biriktirmen gerek (${money(F.needMonthly - F.monthly)} daha).`;
+      }
+    }
+    return `<div class="goal-text">${lines.join(' ')}</div>${warn ? `<div class="warnbox">⚠︎ ${warn}</div>` : ''}`;
+  }
+
   // ---------- UI altyapısı ----------
   const view = $('#view');
   function toast(msg) {
@@ -635,8 +759,12 @@
     const commits = [...s.fixedCats, ...s.instCats];
     const order = { over: 0, unplanned: 1, ok: 2, untouched: 3, empty: 4, pending: 5 };
     const vari = [...s.varCats].sort((a, b) => order[a.status] - order[b.status] || b.spent - a.spent);
-    const savLeft = Math.max(0, s.savingPlanned - s.savingDone);
-    const savPct = s.savingPlanned > 0 ? clamp((s.savingDone / s.savingPlanned) * 100, 0, 100) : 0;
+    const savDoneItems = sum(s.sItems.filter((i) => i.done), 'doneAmount');
+    const savPct = s.savingPlanned > 0 ? clamp((savDoneItems / s.savingPlanned) * 100, 0, 100) : 0;
+    const P = portfolio();
+    const goalWarn = state.savings.goals.map((g) => ({ g, F: goalForecast(g, P) })).filter((x) => !x.F.done && (x.F.late > 0 || x.F.noPlan));
+    const avgMonthly = planSavingTotal(state.plan) || 1;
+    const slip = s.savingShort > 50 ? Math.max(1, Math.round(s.savingShort / avgMonthly)) : 0;
 
     view.innerHTML = `
       ${state.plan && !state.plan.reviewed ? `<div class="banner"><div class="t"><b>Planını gözden geçir</b><br>Birikim ve kategori tutarlarını kendine göre ayarla.</div><button class="btn small" id="review">Planım</button></div>` : ''}
@@ -682,10 +810,19 @@
       </div>
 
       <div class="card">
-        <div class="card-head"><h3>🏦 Birikim</h3><span class="muted small">Planlanan ${money(s.savingPlanned)}</span></div>
-        <div class="bar thick"><i class="good" style="width:${savPct}%"></i></div>
-        <div class="cat-bottom"><span>Aktarılan ${money(s.savingDone)}</span><span class="muted">${savLeft > 0 ? 'Kalan ' + money(savLeft) : s.savingPlanned > 0 ? '✓ Tamamlandı' : ''}</span></div>
-        <div class="btn-row"><button class="btn ${savLeft > 0 ? '' : 'secondary'}" id="btn-save">${savLeft > 0 ? `${money(savLeft)} birikime aktar` : 'Birikime para aktar'}</button></div>
+        <div class="card-head"><h3>🏦 Düzenli birikim</h3><span class="muted small">Planlanan ${money(s.savingPlanned)}</span></div>
+        ${s.sItems.length ? `<ul class="list">${s.sItems.map((i) => {
+          const g = i.goalId && state.savings.goals.find((x) => x.id === i.goalId);
+          return `<li><div class="main"><div class="title">${(ASSETS[i.type] || {}).icon || '🏦'} ${esc(itemLabel(i))}</div>
+            <div class="sub">${i.done ? `<span class="good">✓ Gerçekleşti ${money(i.doneAmount)}</span>${i.doneDate ? ' · ' + shortDate(i.doneDate) : ''}` : `Planlanan ≈ ${money(estItem(i))} · <span class="warn">henüz alınmadı</span>`}${g ? ` · ${esc(g.emoji || '')} ${esc(g.name)}` : ''}</div></div>
+            <div class="right">${i.done ? `<button class="link-btn small" data-undo="${i.id}">Geri al</button>` : `<button class="btn small" data-buy="${i.id}">Aldım</button>`}</div></li>`;
+        }).join('')}</ul>` : `<p class="small muted" style="margin:0 0 6px">Düzenli birikim planın yok. ör. her ay 1 çeyrek altın. <button class="link-btn" id="add-si">Ekle</button></p>`}
+        ${s.sItems.length ? `<div class="bar thick" style="margin-top:6px"><i class="good" style="width:${savPct}%"></i></div>
+        <div class="cat-bottom"><span>Gerçekleşen ${money(savDoneItems)} / planlanan ${money(s.savingPlanned)}</span><span class="muted">${s.savingLeft > 0 ? 'Bekleyen ≈ ' + money(s.savingLeft) : '✓ Tamamlandı'}</span></div>` : ''}
+        ${slip ? `<div class="warnbox">⚠︎ Bütçe planına göre bu ay birikime en fazla <b>${money(Math.max(0, s.savingRoom))}</b> ayırabilirsin; planlanan ${money(s.savingLeft)}. <b>${money(s.savingShort)}</b> eksik kalırsa hedefin yaklaşık <b>${slip} ay</b> sarkar. Harcamaları kısmayı ya da planı güncellemeyi düşün.</div>` : ''}
+        ${goalWarn.map(({ g, F }) => `<div class="warnbox">⚠︎ ${esc(g.emoji || '')} <b>${esc(g.name)}</b>: ${F.noPlan ? 'bu hedefe düzenli birikim planı yok.' : `bu planla hedefe ${F.late} ay geç ulaşıyorsun (tahmini ${monthName(F.eta)}).`} <a href="#/birikim">Detay</a></div>`).join('')}
+        <p class="hint">“Aldım” dediğinde tutar maaşından düşülür ve hedefin ilerler; demezsen ikisi de olmaz.</p>
+        <div class="btn-row"><button class="btn secondary" id="btn-save">Ekstra birikime aktar</button></div>
       </div>
 
       <div class="card">
@@ -734,7 +871,10 @@
     $$('[data-editcat]', view).forEach((b) => (b.onclick = (ev) => { ev.stopPropagation(); categoryForm(m, m.categories.find((c) => c.id === b.dataset.editcat)); }));
     $$('[data-go]', view).forEach((b) => (b.onclick = () => { state.ui.cat = b.dataset.go; state.ui.mode = 'gider'; location.hash = '#/islem'; }));
     $$('[data-pay]', view).forEach((b) => (b.onclick = () => payFixed(m, key, m.categories.find((x) => x.id === b.dataset.pay))));
-    $('#btn-save').onclick = () => transferForm(m, key, savLeft || '');
+    $('#btn-save').onclick = () => transferForm(m, key, '');
+    $$('[data-buy]', view).forEach((b) => (b.onclick = () => buyItemForm(m, key, m.saving.items.find((i) => i.id === b.dataset.buy))));
+    $$('[data-undo]', view).forEach((b) => (b.onclick = () => undoItem(m, m.saving.items.find((i) => i.id === b.dataset.undo))));
+    const asi = $('#add-si'); if (asi) asi.onclick = () => openWizard(state.plan ? 'edit' : 'first', 3);
     const br = $('#btn-rest'); if (br) br.onclick = () => transferForm(m, key, Math.round(s.cash));
   }
 
@@ -780,11 +920,52 @@
         if (t !== 'TRY' && !r) return toast('Kur bilgisi yok');
         const price = t === 'TRY' ? 1 : r.sell;
         state.savings.holdings.push({ id: uid(), type: t, qty: Math.round((a / price) * 10000) / 10000, buyPrice: price, date: todayISO(), note: `${monthName(key)} birikimi` });
-        m.saving = m.saving || { planned: 0, done: 0 };
         m.saving.done = (m.saving.done || 0) + a;
         save(); closeSheet(); toast(`${money(a)} birikime aktarıldı`); renderView();
       };
     });
+  }
+
+  // Planlanan düzenli birikimi "aldım" olarak işaretle: maaştan düşer, birikime ve hedefe eklenir
+  function buyItemForm(m, key, item) {
+    const isTL = item.type === 'TRY';
+    const r = rateOf(item.type);
+    const goals = state.savings.goals;
+    openSheet(`${itemLabel(item)} — aldım`, `
+      <form id="f">
+        ${isTL ? `<div class="field"><label>Biriktirdiğin tutar</label><input class="input big" name="amount" inputmode="decimal" value="${amtStr(item.amount)}" required></div>`
+          : `<div class="row2">
+              <div class="field"><label>${ASSETS[item.type].unit === 'adet' ? 'Adet' : ASSETS[item.type].unit === 'gram' ? 'Gram' : 'Miktar'}</label><input class="input" name="qty" inputmode="decimal" value="${amtStr(item.qty)}" required></div>
+              <div class="field"><label>Birim fiyat (ödediğin)</label><input class="input" name="price" inputmode="decimal" value="${r ? amtStr(Math.round(r.sell * 100) / 100) : amtStr(item.lastPrice)}" required></div>
+            </div><div class="hint" id="tot" style="margin:-4px 0 12px"></div>`}
+        <div class="field"><label>Tarih</label><input class="input" type="date" name="date" value="${monthKeyOf() === key ? todayISO() : key + '-01'}"></div>
+        ${goals.length ? `<div class="field"><label>Hangi hedef için?</label><select class="input" name="goal"><option value="">— Genel birikim —</option>${goals.map((g) => `<option value="${g.id}" ${g.id === item.goalId ? 'selected' : ''}>${esc(g.emoji || '')} ${esc(g.name)}</option>`).join('')}</select></div>` : ''}
+        <button class="btn" type="submit">Aldım — maaştan düş, birikime ekle</button>
+      </form>`, (root) => {
+      const f = $('#f', root);
+      const upd = () => { if (!isTL) $('#tot', root).innerHTML = `Toplam <b>${money((parseAmount(f.qty.value) || 0) * (parseAmount(f.price.value) || 0))}</b> maaşından düşülecek.`; };
+      if (!isTL) { f.qty.oninput = upd; f.price.oninput = upd; upd(); }
+      f.onsubmit = (ev) => {
+        ev.preventDefault();
+        const qty = isTL ? parseAmount(f.amount.value) : parseAmount(f.qty.value);
+        const price = isTL ? 1 : parseAmount(f.price.value);
+        if (!(qty > 0) || !(price > 0)) return toast('Miktar ve fiyatı kontrol et');
+        const amount = Math.round(qty * price * 100) / 100;
+        const goalId = f.goal ? f.goal.value || null : item.goalId || null;
+        const h = { id: uid(), type: item.type, qty, buyPrice: price, date: f.date.value, note: `${monthName(key)} düzenli birikim`, goalId };
+        state.savings.holdings.push(h);
+        Object.assign(item, { done: true, doneAmount: amount, doneDate: f.date.value, holdingId: h.id, goalId });
+        m.saving.done = (m.saving.done || 0) + amount;
+        save(); closeSheet(); toast(`✓ ${itemLabel({ ...item, qty })} birikime eklendi · maaştan ${money(amount)} düştü`); renderView();
+      };
+    });
+  }
+  function undoItem(m, item) {
+    if (!confirm(`${itemLabel(item)} alınmadı olarak geri alınsın mı? Birikimden çıkarılır, maaşa geri eklenir.`)) return;
+    state.savings.holdings = state.savings.holdings.filter((h) => h.id !== item.holdingId);
+    m.saving.done = Math.max(0, (m.saving.done || 0) - (item.doneAmount || 0));
+    Object.assign(item, { done: false, doneAmount: 0, doneDate: undefined, holdingId: undefined });
+    save(); toast('Geri alındı'); renderView();
   }
 
   // ---------- Sayfa: Giriş / Çıkış ----------
@@ -1331,13 +1512,14 @@
 
   // ---------- Plan sihirbazı ----------
   const WSTEPS = ['Gelirlerin', 'Harcama kategorilerin', 'Düzenli ödemelerin', 'Birikim planın', 'Kalanı dağıt', 'Özet'];
-  function openWizard(mode) {
+  function openWizard(mode, step) {
     const base = mode === 'edit' && state.plan ? clone(state.plan) : {
-      incomes: [{ id: uid(), name: 'Maaş', amount: 0 }], fixed: [], saving: 0,
+      incomes: [{ id: uid(), name: 'Maaş', amount: 0 }], fixed: [], savingItems: [],
       categories: SUGGEST_CATS.filter((s) => s.def).map((s) => ({ id: uid(), name: s.name, emoji: s.emoji, planned: 0, subs: (s.subs || []).map((n) => ({ id: uid(), name: n })), toSavings: !!s.toSavings })),
     };
     if (!base.incomes.length) base.incomes.push({ id: uid(), name: 'Maaş', amount: 0 });
-    const w = { step: 0, mode, plan: base, inst: clone(state.installments || []), newInst: [], apply: true };
+    base.savingItems = base.savingItems || [];
+    const w = { step: step || 0, mode, plan: base, inst: clone(state.installments || []), newInst: [], apply: true };
     drawWizard(w);
   }
   function wTotals(w) {
@@ -1346,9 +1528,10 @@
     const fixed = sum(w.plan.fixed, 'amount');
     const taksit = sum(w.inst.filter((i) => instActive(i, now)), 'monthly') + sum(w.newInst, 'monthly');
     const afterFixed = income - fixed - taksit;
-    const kalan = afterFixed - (w.plan.saving || 0);
+    const saving = planSavingTotal(w.plan);
+    const kalan = afterFixed - saving;
     const alloc = sum(w.plan.categories, 'planned');
-    return { income, fixed, taksit, afterFixed, kalan, alloc, unalloc: kalan - alloc };
+    return { income, fixed, taksit, afterFixed, saving, kalan, alloc, unalloc: kalan - alloc };
   }
   function drawWizard(w) {
     const t = wTotals(w);
@@ -1395,16 +1578,25 @@
         <div class="wbox" style="margin-top:12px">Sabit ${money(t.fixed)} + taksit ${money(t.taksit)}<div class="big" id="w-a">${money(t.fixed + t.taksit)}</div><span class="small muted">Gelirden sonra kalan: <b id="w-b">${money(t.afterFixed)}</b></span></div>`;
     } else if (w.step === 3) {
       const sug = suggestPlan(t.income, t.fixed + t.taksit, p.categories).saving;
-      const opts = [[0, 'Şimdilik yok', 'birikim yapmıyorum'], [round50(t.income * 0.1), '%10', 'gelirin onda biri'], [round50(t.income * 0.2), '%20', 'klasik 50/30/20 kuralı'], [sug, 'Önerilen', 'sana göre hesaplandı']];
-      body = `<p class="muted small" style="margin-top:0">Önce birikimini ayır, harcamaları kalandan yap. Bu ay ne kadar biriktirmek istiyorsun?</p>
+      const goals = state.savings.goals;
+      const quick = [['CEYREK', 1, '🪙 Her ay 1 çeyrek'], ['GRAM', 1, '🟨 Her ay 1 gram'], ['USD', 100, '💵 Her ay 100 $'], ['TRY', 0, '🏦 TL birikim']];
+      body = `<p class="muted small" style="margin-top:0">Önce birikimini ayır, harcamaları kalandan yap. Her ay ne biriktirmeyi planlıyorsun? Ay içinde “Aldım” dediğinde maaşından düşer ve hedefin ilerler.</p>
         <div class="wbox">Gelir − sabit giderler − taksitler<div class="big">${money(t.afterFixed)}</div></div>
-        <div class="wopt">${opts.map(([v, n, d]) => `<button type="button" data-sav="${v}" class="${(p.saving || 0) === v ? 'on' : ''}"><b>${money(v)}</b><span>${n} · ${d}</span></button>`).join('')}</div>
-        <div class="field"><label>Ya da kendin yaz</label><input class="input big" data-f="saving" inputmode="decimal" value="${amtStr(p.saving)}" placeholder="₺0"></div>
-        <p class="hint">Önerilen: gelirinin %20'si, ama sabit giderlerden sonra kalanın en fazla %40'ı — böylece günlük harcamalara yeterli pay kalır.</p>
-        <div class="wbox">Birikimden sonra kalan (kategorilere dağıtacağın)<div class="big ${t.kalan < 0 ? 'bad' : ''}" id="w-a">${money(t.kalan)}</div></div>`;
+        <div class="chips">${quick.map(([ty, q, n]) => `<button type="button" data-addsi="${ty}" data-q="${q}">${n}</button>`).join('')}
+          <button type="button" data-addsi="TRY" data-q="0" data-amt="${sug}">✨ Önerilen ${money(sug)}</button></div>
+        ${p.savingItems.map((i) => `<div class="wcat">
+          <div class="wrow" style="grid-template-columns:1fr 104px 36px;margin:0">
+            <select class="input" data-f="si-type" data-id="${i.id}">${SAVING_TYPES.map((ty) => `<option value="${ty}" ${ty === i.type ? 'selected' : ''}>${ASSETS[ty].icon} ${ASSETS[ty].name}</option>`).join('')}</select>
+            <input class="input" data-f="si-val" data-id="${i.id}" inputmode="decimal" value="${amtStr(i.type === 'TRY' ? i.amount : i.qty)}" placeholder="${i.type === 'TRY' ? '₺/ay' : ASSETS[i.type].unit === 'adet' ? 'adet' : ASSETS[i.type].unit === 'gram' ? 'gram' : 'miktar'}">
+            <button type="button" class="x" data-del="si" data-id="${i.id}">✕</button></div>
+          <div class="small muted" style="margin-top:6px">Ayda ≈ <b id="est-${i.id}">${money(estItem(i))}</b>${i.type !== 'TRY' ? ' (bugünkü satış fiyatıyla)' : ''}
+          ${goals.length ? ` · Hedef: <select class="input" data-f="si-goal" data-id="${i.id}" style="display:inline-block;width:auto;padding:4px 28px 4px 8px;font-size:13px"><option value="">Genel</option>${goals.map((g) => `<option value="${g.id}" ${g.id === i.goalId ? 'selected' : ''}>${esc(g.emoji || '')} ${esc(g.name)}</option>`).join('')}</select>` : ''}</div>
+        </div>`).join('') || '<p class="small muted">Şimdilik düzenli birikim yok. Yukarıdan ekleyebilirsin.</p>'}
+        <p class="hint">Önerilen: gelirinin %20'si, ama sabit giderlerden sonra kalanın en fazla %40'ı (${money(sug)}). Altın/döviz tutarı her ay kura göre değişir.</p>
+        <div class="wbox">Aylık birikim ≈ <b id="w-b2">${money(t.saving)}</b> · sonrasında kalan (kategorilere dağıtacağın)<div class="big ${t.kalan < 0 ? 'bad' : ''}" id="w-a">${money(t.kalan)}</div></div>`;
     } else if (w.step === 4) {
       const sp = suggestPlan(t.income, t.fixed + t.taksit, p.categories);
-      body = `<div class="wbox">Kalan (dağıtılabilir)<div class="big ${t.kalan < 0 ? 'bad' : ''}">${money(t.kalan)}</div><span class="small muted">Gelir ${money(t.income)} − sabit ${money(t.fixed)} − taksit ${money(t.taksit)} − birikim ${money(p.saving || 0)}</span></div>
+      body = `<div class="wbox">Kalan (dağıtılabilir)<div class="big ${t.kalan < 0 ? 'bad' : ''}">${money(t.kalan)}</div><span class="small muted">Gelir ${money(t.income)} − sabit ${money(t.fixed)} − taksit ${money(t.taksit)} − birikim ${money(t.saving)}</span></div>
         <p class="muted small">Kalanı kategorilerine sen dağıt. Örneğin İhtiyaçlarım'a kendine ayırdığını yaz.</p>
         ${p.categories.map((c) => `<div class="dist-row"><div><div style="font-weight:600">${esc(c.emoji || '•')} ${esc(c.name)}</div>${(c.subs || []).length ? `<div>${c.subs.map((s) => `<span class="pill-sub">${esc(s.name)}</span>`).join('')}</div>` : ''}</div>
           <input class="input" data-f="cat-plan" data-id="${c.id}" inputmode="decimal" value="${amtStr(c.planned)}" placeholder="₺0"></div>`).join('') || '<p class="muted small">Kategori seçmedin; geri dönüp seçebilirsin.</p>'}
@@ -1418,7 +1610,7 @@
           <li><span class="k">Toplam gelir</span><span class="v">${money(t.income)}</span></li>
           <li class="minus"><span class="k">− Sabit giderler (${p.fixed.length})</span><span class="v">${money(t.fixed)}</span></li>
           <li class="minus"><span class="k">− Taksitler</span><span class="v">${money(t.taksit)}</span></li>
-          <li class="minus"><span class="k">− Birikim</span><span class="v">${money(p.saving || 0)}</span></li>
+          <li class="minus"><span class="k">− Birikim${p.savingItems.length ? ` <span class="muted tiny">(${p.savingItems.map((i) => esc(itemLabel(i))).join(', ')})</span>` : ''}</span><span class="v">${money(t.saving)}</span></li>
           <li class="total"><span class="k">= Kalan</span><span class="v ${t.kalan < 0 ? 'bad' : ''}">${money(t.kalan)}</span></li>
           ${p.categories.map((c) => `<li class="sub"><span class="k">${esc(c.emoji || '')} ${esc(c.name)}${(c.subs || []).length ? ` <span class="muted tiny">(${c.subs.map((s) => esc(s.name)).join(', ')})</span>` : ''}</span><span class="v">${money(c.planned)}</span></li>`).join('')}
           <li class="sub"><span class="k">Dağıtılmamış</span><span class="v ${t.unalloc < 0 ? 'bad' : 'good'}">${money(t.unalloc)}</span></li>
@@ -1442,9 +1634,12 @@
       const val = w.step === 0 ? t.income : w.step === 2 ? t.fixed + t.taksit : w.step === 3 ? t.kalan : t.unalloc;
       a.textContent = money(val); a.classList.toggle('bad', val < 0);
       if (b) b.textContent = money(t.afterFixed);
-      if (w.step === 3) $$('[data-sav]', root).forEach((x) => x.classList.toggle('on', +x.dataset.sav === (p.saving || 0)));
+      const b2 = $('#w-b2', root); if (b2) b2.textContent = money(t.saving);
+      if (w.step === 3) p.savingItems.forEach((i) => { const e = $(`#est-${i.id}`, root); if (e) e.textContent = money(estItem(i)); });
     };
     $$('[data-f]', root).forEach((el) => {
+      if (el.dataset.f === 'si-type') { el.onchange = () => { const i = find(p.savingItems, el.dataset.id); i.type = el.value; if (i.type === 'TRY') { i.amount = i.amount || 0; } else { i.qty = i.qty || 1; } drawWizard(w); }; return; }
+      if (el.dataset.f === 'si-goal') { el.onchange = () => { find(p.savingItems, el.dataset.id).goalId = el.value || null; }; return; }
       const ev = el.type === 'checkbox' ? 'change' : 'input';
       el.addEventListener(ev, () => {
         const id = el.dataset.id, v = el.value;
@@ -1460,7 +1655,7 @@
           case 'ni-name': find(w.newInst, id).name = v; break;
           case 'ni-amt': find(w.newInst, id).monthly = amt0(v); break;
           case 'ni-cnt': find(w.newInst, id).count = parseInt(v, 10) || 0; break;
-          case 'saving': p.saving = amt0(v); break;
+          case 'si-val': { const i = find(p.savingItems, id); if (i.type === 'TRY') i.amount = amt0(v); else i.qty = amt0(v); break; }
         }
         live();
       });
@@ -1484,6 +1679,13 @@
       if (k === 'cat') p.categories = p.categories.filter((x) => x.id !== id);
       if (k === 'inst') w.inst = w.inst.filter((x) => x.id !== id);
       if (k === 'ninst') w.newInst = w.newInst.filter((x) => x.id !== id);
+      if (k === 'si') p.savingItems = p.savingItems.filter((x) => x.id !== id);
+      drawWizard(w);
+    }));
+    $$('[data-addsi]', root).forEach((b) => (b.onclick = () => {
+      const type = b.dataset.addsi, q = +b.dataset.q || 0, a = +b.dataset.amt || 0;
+      const goal = state.savings.goals.length === 1 ? state.savings.goals[0].id : null;
+      p.savingItems.push({ id: uid(), type, qty: type === 'TRY' ? 0 : q, amount: type === 'TRY' ? a : 0, goalId: goal });
       drawWizard(w);
     }));
     $$('[data-tog]', root).forEach((b) => (b.onclick = () => {
@@ -1499,7 +1701,6 @@
     });
     $$('[data-delsub]', root).forEach((b) => (b.onclick = () => { const c = find(p.categories, b.dataset.delsub); c.subs = c.subs.filter((s) => s.id !== b.dataset.sid); drawWizard(w); }));
     $$('[data-addfix]', root).forEach((b) => (b.onclick = () => { p.fixed.push({ id: uid(), name: b.dataset.addfix, emoji: b.dataset.e, amount: 0 }); drawWizard(w); setTimeout(() => { const ins = $$('[data-f="fix-amt"]'); ins.length && ins[ins.length - 1].focus(); }, 60); }));
-    $$('[data-sav]', root).forEach((b) => (b.onclick = () => { p.saving = +b.dataset.sav; drawWizard(w); }));
     const sg = $('[data-act="suggest"]', root);
     if (sg) sg.onclick = () => {
       const t = wTotals(w);
@@ -1523,7 +1724,11 @@
     p.incomes = p.incomes.filter((i) => i.name.trim() && i.amount > 0).map((i) => ({ ...i, name: i.name.trim() }));
     p.fixed = p.fixed.filter((f) => f.name.trim() && f.amount > 0).map((f) => ({ ...f, name: f.name.trim() }));
     p.categories = p.categories.filter((c) => c.name.trim()).map((c) => ({ ...c, name: c.name.trim() }));
-    p.saving = p.saving || 0;
+    p.savingItems = (p.savingItems || []).filter((i) => (i.type === 'TRY' ? i.amount > 0 : i.qty > 0)).map((i) => {
+      const r = rateOf(i.type);
+      return { ...i, lastPrice: r ? r.sell : i.lastPrice };
+    });
+    delete p.saving;
     p.reviewed = true;
     state.plan = p;
     state.installments = w.inst;
@@ -1549,9 +1754,9 @@
         <tbody>
           <tr><td>Gelir</td><td>${money(income)}</td><td>${money(income)}</td></tr>
           <tr><td>Sabit + taksit</td><td>${money(fixed + taksit)}</td><td>${money(fixed + taksit)}</td></tr>
-          <tr><td><b>Birikim</b></td><td>${money(p.saving || 0)}</td><td><b>${money(sp.saving)}</b></td></tr>
+          <tr><td><b>Birikim</b></td><td>${money(planSavingTotal(p))}</td><td><b>${money(sp.saving)}</b></td></tr>
           ${p.categories.map((c) => `<tr><td>${esc(c.emoji || '')} ${esc(c.name)}</td><td>${money(c.planned)}</td><td>${money(sp.alloc[c.id])}</td></tr>`).join('')}
-          <tr><td>Serbest / beklenmedik</td><td>${money(income - fixed - taksit - (p.saving || 0) - sum(p.categories, 'planned'))}</td><td>${money(sp.buffer)}</td></tr>
+          <tr><td>Serbest / beklenmedik</td><td>${money(income - fixed - taksit - planSavingTotal(p) - sum(p.categories, 'planned'))}</td><td>${money(sp.buffer)}</td></tr>
         </tbody></table></div>
       <ul class="list small" style="margin-top:10px">
         <li><div class="main"><div class="title">Birikim</div><div class="sub">Gelirin %20'si; sabitlerden sonra kalanın en fazla %40'ı (${money(sp.afterFixed)} × %40).</div></div></li>
@@ -1562,10 +1767,16 @@
       <p class="hint">Uyguladıktan sonra Planım'dan istediğin tutarı değiştirebilirsin. Bu ay ve sonraki aylar güncellenir.</p>`, (root) => {
       $('#apply-sug', root).onclick = () => {
         if (!confirm('Birikim ve kategori tutarları önerilen değerlerle değişsin mi?')) return;
-        p.saving = sp.saving;
+        // Altın/döviz kalemleri korunur; önerilen tutara kadar olan farkı TL birikim kalemi tamamlar
+        p.savingItems = p.savingItems || [];
+        const nonTL = sum(p.savingItems.filter((i) => i.type !== 'TRY'), estItem);
+        const tl = p.savingItems.find((i) => i.type === 'TRY');
+        const need = round50(Math.max(0, sp.saving - nonTL));
+        if (tl) tl.amount = need; else if (need > 0) p.savingItems.push({ id: uid(), type: 'TRY', amount: need, qty: 0, goalId: null });
+        p.savingItems = p.savingItems.filter((i) => (i.type === 'TRY' ? i.amount > 0 : true));
         p.categories.forEach((c) => (c.planned = sp.alloc[c.id]));
         p.reviewed = true;
-        syncFuture(new Set(['saving', ...p.categories.map((c) => c.id)]));
+        syncFuture(new Set([...p.savingItems.map((i) => i.id), ...p.categories.map((c) => c.id)]));
         save(); closeSheet(); toast('Önerilen plan uygulandı'); renderView();
       };
     });
@@ -1680,25 +1891,34 @@
         <div class="hero-sub">Maliyet ${money(P.cost)} · <b class="${P.pl < 0 ? 'bad' : 'good'}">${signed(P.pl)} (${pct(P.plPct)})</b></div>
         ${r && r.data.USD ? `<div class="hero-sub" style="margin-top:4px">≈ $${nf0.format(P.value / r.data.USD.buy)} · ≈ ${num(P.value / (r.data.GRA?.buy || 1))} gr altın</div>` : ''}
       </div>
-      <div class="section-title">Hedefler</div>
+      <div class="section-title">Hedeflerim</div>
       ${goals.map((g) => {
-        const cur = g.mode === 'manual' ? +g.manual || 0 : P.value;
-        const p = g.target ? clamp((cur / g.target) * 100, 0, 100) : 0;
-        const leftAmt = Math.max(0, g.target - cur);
-        let monthly = '';
-        if (g.deadline && leftAmt > 0) {
-          const n = monthDiff(monthKeyOf(), g.deadline);
-          monthly = n > 0 ? `Hedefe ${n} ay var · ayda <b>${money(leftAmt / n)}</b> biriktirmelisin` : '<span class="bad">Hedef tarihi geçti</span>';
-        }
-        return `<div class="card tap" data-goal="${g.id}">
-          <div class="card-head"><h3>${esc(g.emoji || '🎯')} ${esc(g.name)}</h3><b>${pct(p)}</b></div>
-          <div class="bar thick"><i class="${p >= 100 ? 'good' : ''}" style="width:${p}%"></i></div>
-          <div class="cat-bottom"><span>${money(cur)} / ${money(g.target)}</span><span class="muted">Kalan ${money(leftAmt)}</span></div>
-          ${monthly ? `<div class="small muted" style="margin-top:6px">${monthly}${state.plan && state.plan.saving ? ` · planındaki aylık birikim ${money(state.plan.saving)}` : ''}</div>` : ''}
-          ${p >= 100 ? '<div class="small good" style="margin-top:6px">🎉 Hedefe ulaştın!</div>' : ''}
+        const F = goalForecast(g, P);
+        const kind = GOAL_KINDS[g.kind] || GOAL_KINDS.other;
+        return `<div class="card">
+          <div class="card-head"><h3>${esc(g.emoji || kind[0])} ${esc(g.name)}</h3><button class="link-btn" data-goal="${g.id}">Düzenle</button></div>
+          <div class="cat-bottom" style="margin:0 0 4px"><span class="muted small">${g.kind === 'debt' ? 'Borç' : 'Hedef'} ${money(g.target)}</span><span class="muted small">${g.mode === 'linked' ? 'Bu hedefe bağlı birikimler' : g.mode === 'manual' ? 'Elle girilen tutar' : 'Tüm birikimin'}</span></div>
+          ${goalTrack(g, F)}
+          ${goalText(g, F)}
         </div>`;
-      }).join('')}
+      }).join('') || '<div class="card empty small">Araba, ev, borç bitirme gibi bir hedef ekle; ilerlemeni yol haritasında gör.</div>'}
       <button class="btn secondary" id="add-goal">+ Hedef ekle</button>
+
+      <div class="section-title">Düzenli birikim — planlanan / gerçekleşen</div>
+      <div class="card">
+        ${state.plan && (state.plan.savingItems || []).length ? `<ul class="list">${state.plan.savingItems.map((i) => `<li><div class="main"><div class="title">${(ASSETS[i.type] || {}).icon || ''} Her ay ${esc(itemLabel(i))}</div><div class="sub">≈ ${money(estItem(i))} / ay${i.goalId ? ' · ' + esc((goals.find((g) => g.id === i.goalId) || {}).name || '') : ''}</div></div></li>`).join('')}</ul>`
+          : '<p class="small muted" style="margin:0">Henüz düzenli birikim planın yok.</p>'}
+        ${(() => {
+          const ks = monthKeys().filter((k) => k <= monthKeyOf()).slice(-6).reverse();
+          const rows = ks.map((k) => { const mm = state.months[k]; const it = mm.saving.items || []; return { k, it, plan: sum(it, (i) => (i.done ? i.doneAmount : estItem(i))), done: sum(it.filter((i) => i.done), 'doneAmount'), n: it.length, nd: it.filter((i) => i.done).length }; }).filter((x) => x.n);
+          if (!rows.length) return '';
+          return `<div class="table-wrap" style="margin-top:10px"><table class="t" style="min-width:0">
+            <thead><tr><th>Ay</th><th>Planlanan</th><th>Gerçekleşen</th><th>Durum</th></tr></thead>
+            <tbody>${rows.map((x) => `<tr><td>${monthName(x.k, true)}</td><td>${money(x.plan)}</td><td>${money(x.done)}</td>
+              <td>${x.nd === x.n ? '<span class="chip good">✓ Tamam</span>' : x.k < monthKeyOf() ? `<span class="chip bad">✗ ${x.n - x.nd} alınmadı</span>` : `<span class="chip warn">○ Bekliyor</span>`}</td></tr>`).join('')}</tbody></table></div>`;
+        })()}
+        <button class="btn secondary" id="edit-si" style="margin-top:12px">Düzenli birikim planını değiştir</button>
+      </div>
       <div class="section-title">Varlıklarım</div>
       <div class="card" style="padding:4px 16px">
         <ul class="list">${P.rows.map((h) => {
@@ -1731,6 +1951,7 @@
     $$('[data-h]', view).forEach((li) => (li.onclick = () => holdingForm(state.savings.holdings.find((h) => h.id === li.dataset.h))));
     $('#add-goal').onclick = () => goalForm();
     $$('[data-goal]', view).forEach((c) => (c.onclick = () => goalForm(goals.find((g) => g.id === c.dataset.goal))));
+    $('#edit-si').onclick = () => openWizard(state.plan ? 'edit' : 'first', 3);
     $('#ref').onclick = () => refreshRates({ force: true });
     $$('[data-rate]', view).forEach((el) => (el.onclick = () => rateOverrideForm(el.dataset.rate, el.dataset.name)));
   }
@@ -1750,6 +1971,7 @@
           <div class="field"><label>Alış tarihi</label><input class="input" type="date" name="date" value="${x.date}"></div>
           <div class="field"><label>Not</label><input class="input" name="note" value="${esc(x.note || '')}" placeholder="ör. Hediye"></div>
         </div>
+        ${state.savings.goals.length ? `<div class="field"><label>Hangi hedef için?</label><select class="input" name="goal"><option value="">— Genel birikim —</option>${state.savings.goals.map((g) => `<option value="${g.id}" ${g.id === x.goalId ? 'selected' : ''}>${esc(g.emoji || '')} ${esc(g.name)}</option>`).join('')}</select></div>` : ''}
         <button class="btn" type="submit">Kaydet</button>
         ${isNew ? '' : '<div class="btn-row"><button class="btn danger" type="button" id="del">Sil / Sattım</button></div>'}
       </form>`, (root) => {
@@ -1768,7 +1990,7 @@
         ev.preventDefault();
         const qty = parseAmount(f.qty.value), buyPrice = parseAmount(f.buyPrice.value);
         if (!(qty > 0) || !(buyPrice > 0)) return toast('Miktar ve fiyatı kontrol et');
-        const data = { type: f.type.value, qty, buyPrice, date: f.date.value, note: f.note.value.trim() };
+        const data = { type: f.type.value, qty, buyPrice, date: f.date.value, note: f.note.value.trim(), goalId: f.goal ? f.goal.value || null : x.goalId || null };
         if (isNew) state.savings.holdings.push({ id: uid(), ...data }); else Object.assign(h, data);
         save(); closeSheet(); renderView();
       };
@@ -1779,36 +2001,57 @@
 
   function goalForm(g) {
     const isNew = !g;
-    const x = g || { name: '', emoji: '🎯', target: '', deadline: '', mode: 'all', manual: 0 };
+    const x = g || { name: '', emoji: '', kind: 'car', target: '', deadline: '', mode: 'all', manual: 0 };
     openSheet(isNew ? 'Hedef ekle' : 'Hedefi düzenle', `
       <form id="f">
+        <div class="field"><label>Ne için biriktiriyorsun?</label>
+          <div class="chips" id="kinds">${Object.entries(GOAL_KINDS).map(([k, [ic, n]]) => `<button type="button" data-k="${k}" class="${(x.kind || 'other') === k ? 'on' : ''}">${ic} ${n}</button>`).join('')}</div></div>
         <div class="row2" style="grid-template-columns:80px 1fr">
-          <div class="field"><label>Simge</label><input class="input" name="emoji" value="${esc(x.emoji || '')}" maxlength="4" style="text-align:center"></div>
-          <div class="field"><label>Hedef adı</label><input class="input" name="name" value="${esc(x.name)}" placeholder="ör. Araba, Tatil" required></div>
+          <div class="field"><label>Simge</label><input class="input" name="emoji" value="${esc(x.emoji || GOAL_KINDS[x.kind || 'other'][0])}" maxlength="4" style="text-align:center"></div>
+          <div class="field"><label>Hedef adı</label><input class="input" name="name" value="${esc(x.name)}" placeholder="ör. İlk arabam" required></div>
         </div>
         <div class="row2">
-          <div class="field"><label>Hedef tutar (₺)</label><input class="input" name="target" inputmode="decimal" value="${amtStr(x.target)}" required></div>
-          <div class="field"><label>Hedef tarih</label><input class="input" type="month" name="deadline" value="${x.deadline || ''}"></div>
+          <div class="field"><label id="tgt-l">${x.kind === 'debt' ? 'Borç tutarı (₺)' : 'Hedef tutar (₺)'}</label><input class="input" name="target" inputmode="decimal" value="${amtStr(x.target)}" required></div>
+          <div class="field"><label>Hedef ay</label><input class="input" type="month" name="deadline" value="${x.deadline || ''}"></div>
         </div>
         <div class="field"><label>İlerleme neye göre hesaplansın?</label>
-          <select class="input" name="mode"><option value="all" ${x.mode === 'all' ? 'selected' : ''}>Tüm birikimimin güncel değeri</option><option value="manual" ${x.mode === 'manual' ? 'selected' : ''}>Kendi girdiğim tutar</option></select></div>
+          <select class="input" name="mode">
+            <option value="all" ${x.mode === 'all' ? 'selected' : ''}>Tüm birikimimin güncel değeri</option>
+            <option value="linked" ${x.mode === 'linked' ? 'selected' : ''}>Sadece bu hedefe bağladığım birikimler</option>
+            <option value="manual" ${x.mode === 'manual' ? 'selected' : ''}>Kendi girdiğim tutar</option></select>
+          <div class="hint">Birden fazla hedefin varsa “bağladığım birikimler”i seç; “Aldım” derken ya da varlık eklerken hedefi seçersin.</div></div>
         <div class="field" id="man"><label>Bu hedef için biriken (₺)</label><input class="input" name="manual" inputmode="decimal" value="${amtStr(x.manual)}"></div>
         <button class="btn" type="submit">Kaydet</button>
         ${isNew ? '' : '<div class="btn-row"><button class="btn danger" type="button" id="del">Sil</button></div>'}
       </form>`, (root) => {
       const f = $('#f', root);
+      let kind = x.kind || 'other';
+      $$('#kinds button', root).forEach((b) => (b.onclick = () => {
+        const prevIcon = GOAL_KINDS[kind][0], prevName = GOAL_KINDS[kind][1];
+        kind = b.dataset.k;
+        $$('#kinds button', root).forEach((y) => y.classList.toggle('on', y === b));
+        if (!f.emoji.value || f.emoji.value === prevIcon) f.emoji.value = GOAL_KINDS[kind][0];
+        if (!f.name.value || f.name.value === prevName) f.name.value = GOAL_KINDS[kind][1];
+        $('#tgt-l', root).textContent = kind === 'debt' ? 'Borç tutarı (₺)' : 'Hedef tutar (₺)';
+      }));
       const t = () => ($('#man', root).hidden = f.mode.value !== 'manual');
       f.mode.onchange = t; t();
       f.onsubmit = (ev) => {
         ev.preventDefault();
         const target = parseAmount(f.target.value);
         if (!(target > 0)) return toast('Hedef tutarı gir');
-        const data = { name: f.name.value.trim(), emoji: f.emoji.value.trim(), target, deadline: f.deadline.value, mode: f.mode.value, manual: parseAmount(f.manual.value) || 0 };
+        const data = { name: f.name.value.trim(), emoji: f.emoji.value.trim(), kind, target, deadline: f.deadline.value, mode: f.mode.value, manual: parseAmount(f.manual.value) || 0 };
         if (isNew) state.savings.goals.push({ id: uid(), ...data }); else Object.assign(g, data);
         save(); closeSheet(); renderView();
       };
       const del = $('#del', root);
-      if (del) del.onclick = () => { if (confirm('Hedef silinsin mi?')) { state.savings.goals = state.savings.goals.filter((y) => y.id !== g.id); save(); closeSheet(); renderView(); } };
+      if (del) del.onclick = () => {
+        if (!confirm('Hedef silinsin mi?')) return;
+        state.savings.goals = state.savings.goals.filter((y) => y.id !== g.id);
+        state.savings.holdings.forEach((h) => { if (h.goalId === g.id) h.goalId = null; });
+        if (state.plan) (state.plan.savingItems || []).forEach((i) => { if (i.goalId === g.id) i.goalId = null; });
+        save(); closeSheet(); renderView();
+      };
     });
   }
 
@@ -1857,8 +2100,8 @@
         ${p ? `<ul class="wf">
           <li><span class="k">Gelir (${p.incomes.length})</span><span class="v">${money(pt.income)}</span></li>
           <li class="minus"><span class="k">− Sabit (${p.fixed.length}) + taksit</span><span class="v">${money(pt.fixed + pt.taksit)}</span></li>
-          <li class="minus"><span class="k">− Birikim</span><span class="v">${money(p.saving || 0)}</span></li>
-          <li class="total"><span class="k">= Kalan</span><span class="v">${money(pt.income - pt.fixed - pt.taksit - (p.saving || 0))}</span></li>
+          <li class="minus"><span class="k">− Birikim</span><span class="v">${money(planSavingTotal(p))}</span></li>
+          <li class="total"><span class="k">= Kalan</span><span class="v">${money(pt.income - pt.fixed - pt.taksit - planSavingTotal(p))}</span></li>
           <li class="sub"><span class="k">${p.categories.length} kategoriye ayrılan</span><span class="v">${money(pt.alloc)}</span></li>
         </ul>
         <button class="btn" id="plan-edit" style="margin-top:10px">Planımı düzenle</button>

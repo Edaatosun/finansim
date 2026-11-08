@@ -384,3 +384,19 @@ textarea.input { resize: vertical; font-size: 15px; }
 .dist-row:first-of-type { border-top: 0; }
 .dist-row .input { padding: 10px; text-align: right; }
 .pill-sub { display: inline-block; font-size: 11.5px; background: var(--surface-2); color: var(--text-2); border-radius: 999px; padding: 2px 8px; margin: 3px 4px 0 0; }
+
+/* v4 — hedef yol haritası, uyarılar */
+.track { display: flex; align-items: center; gap: 10px; margin: 18px 0 2px; }
+.track-bar { position: relative; flex: 1; height: 12px; background: var(--surface-2); border-radius: 999px; }
+.track-bar > i { position: absolute; left: 0; top: 0; bottom: 0; border-radius: 999px; background: var(--spent); transition: width .4s; }
+.track-bar .ms { position: absolute; top: 50%; width: 10px; height: 10px; margin: -5px 0 0 -5px; border-radius: 50%; background: var(--surface); border: 2px solid var(--line); }
+.track-bar .ms.on { border-color: var(--surface); background: var(--good); }
+.track-bar .runner { position: absolute; bottom: 16px; transform: translateX(-50%); font-size: 11px; font-weight: 700; color: var(--text); background: var(--surface); border: 1px solid var(--line); border-radius: 999px; padding: 1px 6px; white-space: nowrap; }
+.track-end { flex: none; width: 46px; height: 46px; border-radius: 14px; display: grid; place-items: center; font-size: 26px; background: var(--surface-2); border: 2px dashed var(--line); filter: grayscale(.6); opacity: .85; }
+.track-end.done { filter: none; opacity: 1; border: 2px solid var(--good); background: var(--good-soft); }
+.track-labels { display: flex; justify-content: space-between; font-size: 10.5px; color: var(--text-3); margin: 4px 56px 0 0; }
+.goal-text { font-size: 13.5px; color: var(--text-2); margin-top: 10px; line-height: 1.55; }
+.goal-text b { color: var(--text); }
+.warnbox { background: var(--warn-soft); color: var(--text); border-radius: 12px; padding: 10px 12px; font-size: 13.5px; margin-top: 10px; line-height: 1.5; }
+.warnbox a { font-weight: 600; }
+.link-btn.small { font-size: 13px; }
