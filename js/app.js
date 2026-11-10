@@ -767,6 +767,23 @@
     if (c.noSub > 0) parts.push(`Diğer ${money(c.noSub)}`);
     return `<div class="subline">${parts.join(' · ')}</div>`;
   };
+  // Açık (detayı gösterilen) kategoriler — yalnızca bu oturumda
+  const openCats = new Set();
+  // Kategoriye dokununca: alt başlık bazında toplamlar + o ayki tüm giderler
+  function catDetail(m, c) {
+    const subName = (e) => ((c.subs || []).find((s) => s.id === e.subId) || {}).name || '';
+    const ex = m.expenses.filter((e) => e.catId === c.id).sort((a, b) => (b.date + b.id).localeCompare(a.date + a.id));
+    const subs = c.bySub && c.bySub.length ? c.bySub : [];
+    return `<div class="cat-detail">
+      ${subs.length ? `<div class="cd-title">Neye ne kadar</div><ul class="list cd-subs">${subs.map((s) => `<li><div class="main"><div class="title">${esc(s.name)}</div>${s.planned > 0 ? `<div class="sub">Limit ${money(s.planned)} · ${s.spent > s.planned ? `<span class="bad">${money(s.spent - s.planned)} aşım</span>` : money(s.planned - s.spent) + ' kaldı'}</div>` : ''}</div><div class="amt">${money(s.spent)}</div></li>`).join('')}
+        ${c.noSub > 0 ? `<li><div class="main"><div class="title muted">Alt başlıksız</div></div><div class="amt">${money(c.noSub)}</div></li>` : ''}</ul>` : ''}
+      <div class="cd-title">${monthName(curMonthKey())} harcamaları</div>
+      ${ex.length ? `<ul class="list">${ex.map((e) => `<li class="tap" data-exp="${e.id}"><div class="main"><div class="title">${esc(e.desc || c.name)}</div><div class="sub">${shortDate(e.date)}${subName(e) ? ' · ' + esc(subName(e)) : ''}${e.note ? ' · ' + esc(e.note) : ''}</div></div><div class="amt">−${money(e.amount)}</div></li>`).join('')}</ul>`
+        : '<p class="small muted" style="margin:4px 0">Bu ay bu kategoride henüz gider yok — limitin olduğu gibi duruyor.</p>'}
+      <button class="btn small secondary" data-go="${c.id}" style="margin-top:8px">+ ${esc(c.name)} için gider gir</button>
+    </div>`;
+  }
+
   // Plan seçimi: kendi planı / önerilen plan / boş plan
   const planChoiceHTML = () => `
     <button class="choice" data-pc="own"><span class="ic">✍️</span><span><b>Kendi planımı oluşturayım</b><br><span class="muted small">Gelir → sabit giderler → birikim → kalanı kategorilere dağıt</span></span></button>
@@ -840,16 +857,17 @@
       <div class="card hero">
         <div class="hero-label">${s.phase === 'past' ? 'Ay sonunda elinde kalan' : 'Elinde kalan'}</div>
         <div class="hero-num ${s.cash < 0 ? 'bad' : ''}">${money(s.cash)}</div>
-        <div class="hero-sub">Gelir ${money(s.income)} · Harcanan ${money(s.spent)}${s.savingDone ? ` · Birikime ${money(s.savingDone)}` : ''}</div>
+        <div class="hero-sub">Gelir ${money(s.income)} − girdiğin giderler ${money(s.spent)}${s.savingDone ? ` − birikime yatırılan ${money(s.savingDone)}` : ''}</div>
         <div class="bar thick" style="margin-top:12px"><i class="${s.spent > s.income ? 'over' : ''}" style="width:${usedPct}%"></i></div>
         <div class="stats">
-          <div class="stat"><div class="k">Bütçede kalan</div><div class="v ${s.vsPlan < 0 ? 'bad' : 'good'}">${money(s.vsPlan)}</div></div>
+          <div class="stat"><div class="k">Limitlerinde kalan</div><div class="v ${s.vsPlan < 0 ? 'bad' : 'good'}">${money(s.vsPlan)}</div></div>
           <div class="stat"><div class="k">${s.phase === 'current' ? 'Günlük harcama hakkın' : 'Tasarruf oranı'}</div><div class="v">${s.phase === 'current' ? money(daily) : pct(s.savingRate)}</div></div>
         </div>
       </div>
 
       <div class="card">
         <div class="card-head"><h3>🧭 Bu ayın planı</h3><button class="link-btn" id="edit-plan">Planımı düzenle</button></div>
+        <p class="small muted" style="margin:-4px 0 6px">Bunlar sadece limit ve hedefler; paradan hiçbir şey düşmez. Para yalnızca gider girdiğinde, “Öde” ya da “Aldım” dediğinde düşer.</p>
         <ul class="wf">
           <li><span class="k">Toplam gelir</span><span class="v">${money(s.income)}</span></li>
           <li class="minus"><span class="k">− Sabit giderler</span><span class="v">${money(s.fixedPlan)}</span></li>
@@ -873,7 +891,7 @@
           <div class="main"><div class="title">${esc(c.emoji || '•')} ${esc(catLabel(c))}</div>
             <div class="sub">${c.kind === 'taksit' ? 'Taksit · ' : ''}${c.spent > 0 ? `Ödenen ${money(c.spent)}${c.diff !== 0 ? ` · ${c.diff > 0 ? 'plandan ' + money(c.diff) + ' az' : '<span class="bad">' + money(-c.diff) + ' fazla</span>'}` : ''}` : 'Henüz ödenmedi'}</div></div>
           <div class="right"><div class="amt">${money(c.planned)}</div>
-            ${c.spent > 0 ? '<span class="chip good">✓ Ödendi</span>' : `<button class="btn small" data-pay="${c.id}">Öde</button>`}</div></li>`).join('') || '<li class="muted small">Sabit gider veya taksit yok. <a href="#/odemeler">Ödemeler</a> sayfasından ekle.</li>'}</ul>
+            ${c.spent > 0 ? `<span class="chip good">✓ Ödendi</span><br><button class="link-btn small" data-unpay="${c.id}">Geri al</button>` : `<button class="btn small" data-pay="${c.id}">Öde</button>`}</div></li>`).join('') || '<li class="muted small">Sabit gider veya taksit yok. <a href="#/odemeler">Ödemeler</a> sayfasından ekle.</li>'}</ul>
         ${commits.length ? `<div class="card-foot"><span class="muted small">Ödenen ${money(sum(commits, 'spent'))} / ${money(s.committed)}</span><b class="${s.pendingFixed > 0 ? '' : 'good'}">${s.pendingFixed > 0 ? 'Kalan ' + money(s.pendingFixed) : 'Hepsi ödendi'}</b></div>` : ''}
       </div>
 
@@ -887,7 +905,7 @@
         }).join('')}</ul>` : `<p class="small muted" style="margin:0 0 6px">Düzenli birikim planın yok. ör. her ay 1 çeyrek altın. <button class="link-btn" id="add-si">Ekle</button></p>`}
         ${s.sItems.length ? `<div class="bar thick" style="margin-top:6px"><i class="good" style="width:${savPct}%"></i></div>
         <div class="cat-bottom"><span>Gerçekleşen ${money(savDoneItems)} / planlanan ${money(s.savingPlanned)}</span><span class="muted">${s.savingLeft > 0 ? 'Bekleyen ≈ ' + money(s.savingLeft) : '✓ Tamamlandı'}</span></div>` : ''}
-        ${slip ? `<div class="warnbox">⚠︎ Bütçe planına göre bu ay birikime en fazla <b>${money(Math.max(0, s.savingRoom))}</b> ayırabilirsin; planlanan ${money(s.savingLeft)}. <b>${money(s.savingShort)}</b> eksik kalırsa hedefin yaklaşık <b>${slip} ay</b> sarkar. Harcamaları kısmayı ya da planı güncellemeyi düşün.</div>` : ''}
+        ${slip ? `<div class="warnbox">⚠︎ Tahmin: bu ayki harcama limitlerini sonuna kadar kullanırsan birikime en fazla <b>${money(Math.max(0, s.savingRoom))}</b> kalır; planlanan ${money(s.savingLeft)}. <b>${money(s.savingShort)}</b> eksik kalırsa hedefin yaklaşık <b>${slip} ay</b> sarkar. (Limitler paradan düşmez; bu yalnızca uyarı.)</div>` : ''}
         ${goalWarn.map(({ g, F }) => `<div class="warnbox">⚠︎ ${esc(g.emoji || '')} <b>${esc(g.name)}</b>: ${F.noPlan ? 'bu hedefe düzenli birikim planı yok.' : `bu planla hedefe ${F.late} ay geç ulaşıyorsun (tahmini ${monthName(F.eta)}).`} <a href="#/birikim">Detay</a></div>`).join('')}
         <p class="hint">“Aldım” dediğinde tutar maaşından düşülür ve hedefin ilerler; demezsen ikisi de olmaz.</p>
         <div class="btn-row"><button class="btn secondary" id="btn-save">Ekstra birikime aktar</button></div>
@@ -895,16 +913,18 @@
 
       <div class="card">
         <div class="card-head"><h3>🗂️ Kategorilerim</h3><button class="btn small secondary" id="add-cat">+ Kategori</button></div>
-        ${vari.length ? vari.map((c) => `<div class="cat-row">
-            <div class="cat-top">
-              <div class="cat-name tap" data-go="${c.id}"><span>${esc(c.emoji || '•')}</span><span class="t">${esc(c.name)}</span></div>
-              <div class="cat-amt">${money(c.spent)} / ${money(c.planned)} <button class="mini-btn" data-editcat="${c.id}" aria-label="${esc(c.name)} düzenle">✎</button></div>
+        ${vari.length ? vari.map((c) => `<div class="cat-row ${openCats.has(c.id) ? 'open' : ''}">
+            <div class="tap" data-toggle="${c.id}">
+              <div class="cat-top">
+                <div class="cat-name"><span>${esc(c.emoji || '•')}</span><span class="t">${esc(c.name)}</span><span class="caret">${openCats.has(c.id) ? '▾' : '▸'}</span></div>
+                <div class="cat-amt">${money(c.spent)} / ${money(c.planned)} <button class="mini-btn" data-editcat="${c.id}" aria-label="${esc(c.name)} düzenle">✎</button></div>
+              </div>
+              ${catBar(c)}
+              <div class="cat-bottom"><span>Limit ${money(c.planned)} · harcanan ${money(c.spent)} · <b class="${c.diff < 0 ? 'bad' : 'good'}">${c.diff < 0 ? money(-c.diff) + ' aşım' : money(c.diff) + ' kaldı'}</b></span><span class="muted">${c.count} işlem</span></div>
             </div>
-            <div class="tap" data-go="${c.id}">${catBar(c)}</div>
-            ${subLine(c)}
-            <div class="cat-bottom"><span>${statusChip(c, s.phase)}${c.toSavings && c.diff > 0 ? ' <span class="chip neutral">artanı birikime</span>' : ''}</span><span class="muted">${c.count} işlem</span></div>
+            ${openCats.has(c.id) ? catDetail(m, c) : ''}
           </div>`).join('') : `<div class="empty small">Henüz kategori yok. İhtiyaçlarım, market, yol gibi kategoriler ekle.</div>`}
-        <p class="hint">Kategoriye dokun → Giriş/Çıkış sayfasında detayı ve bu ayki harcamaları. ✎ → tutar, alt başlıklar, silme.</p>
+        <p class="hint">Limit sadece plandır; kategoriden yalnızca gider girdiğinde düşer. Kategoriye dokun → altında neye ne kadar harcadığını gör. ✎ → limit, alt başlıklar, silme.</p>
       </div>
 
       <div class="card">
@@ -937,7 +957,15 @@
     $$('[data-inc]', view).forEach((li) => (li.onclick = () => incomeForm(m, m.incomes.find((i) => i.id === li.dataset.inc))));
     $('#add-cat').onclick = () => categoryForm(m, null);
     $$('[data-editcat]', view).forEach((b) => (b.onclick = (ev) => { ev.stopPropagation(); categoryForm(m, m.categories.find((c) => c.id === b.dataset.editcat)); }));
-    $$('[data-go]', view).forEach((b) => (b.onclick = () => { state.ui.cat = b.dataset.go; state.ui.mode = 'gider'; location.hash = '#/islem'; }));
+    $$('[data-go]', view).forEach((b) => (b.onclick = (ev) => { ev.stopPropagation(); state.ui.cat = b.dataset.go; state.ui.mode = 'gider'; location.hash = '#/islem'; }));
+    $$('[data-toggle]', view).forEach((b) => (b.onclick = () => { const id = b.dataset.toggle; if (openCats.has(id)) openCats.delete(id); else openCats.add(id); renderOzet(); }));
+    $$('[data-exp]', view).forEach((li) => (li.onclick = (ev) => { ev.stopPropagation(); expenseForm(m.expenses.find((e) => e.id === li.dataset.exp)); }));
+    $$('[data-unpay]', view).forEach((b) => (b.onclick = () => {
+      const c = m.categories.find((x) => x.id === b.dataset.unpay);
+      if (!confirm(`${catLabel(c)} ödenmedi olarak geri alınsın mı? Ödeme kaydı silinir, tutar paraya geri eklenir.`)) return;
+      m.expenses = m.expenses.filter((e) => e.catId !== c.id);
+      save(); toast('Ödeme geri alındı'); renderView();
+    }));
     $$('[data-pay]', view).forEach((b) => (b.onclick = () => payFixed(m, key, m.categories.find((x) => x.id === b.dataset.pay))));
     $('#btn-save').onclick = () => transferForm(m, key, '');
     $$('[data-buy]', view).forEach((b) => (b.onclick = () => buyItemForm(m, key, m.saving.items.find((i) => i.id === b.dataset.buy))));
@@ -989,6 +1017,8 @@
         const price = t === 'TRY' ? 1 : r.sell;
         state.savings.holdings.push({ id: uid(), type: t, qty: Math.round((a / price) * 10000) / 10000, buyPrice: price, date: todayISO(), note: `${monthName(key)} birikimi` });
         m.saving.done = (m.saving.done || 0) + a;
+        m.saving.log = m.saving.log || [];
+        m.saving.log.push({ date: monthKeyOf() === key ? todayISO() : `${key}-${pad(daysInMonth(key))}`, label: t === 'TRY' ? 'TL' : ASSETS[t].name, amount: a });
         save(); closeSheet(); toast(`${money(a)} birikime aktarıldı`); renderView();
       };
     });
@@ -1385,7 +1415,7 @@
       $('#new-sub', root).onchange = (ev) => {
         const n = ev.target.value.trim(); if (!n) return; keep();
         const free = Math.max(0, (parseAmount(c.planned) || 0) - sum(c.subs, 'planned'));
-        c.subs.push({ id: uid(), name: n, planned: free }); draw(); setTimeout(() => $('#new-sub').focus(), 50);
+        c.subs.push({ id: uid(), name: n, planned: 0 }); draw(); setTimeout(() => $('#new-sub').focus(), 50);
       };
       $$('[data-dsub]', root).forEach((b) => (b.onclick = () => {
         const inUse = m.expenses.some((e) => e.subId === b.dataset.dsub);
@@ -1840,7 +1870,7 @@
         const n = inp.value.trim(); if (!n) return;
         const c = find(p.categories, inp.dataset.addsub); c.subs = c.subs || [];
         const free = Math.max(0, (+c.planned || 0) - sum(c.subs, 'planned'));
-        c.subs.push({ id: uid(), name: n, planned: free });
+        c.subs.push({ id: uid(), name: n, planned: 0 });
         drawWizard(w);
       };
     });
@@ -2364,12 +2394,66 @@
     };
   }
 
-  function download(name, content, type) {
+  // Dosya indirme: iPhone/Android'de (özellikle ana ekran uygulamasında) <a download> güvenilir değil,
+  // bu yüzden önce paylaşım ekranı (Dosyalar'a Kaydet, WhatsApp, Mail…) denenir; olmazsa klasik indirme.
+  async function download(name, content, type) {
     const blob = new Blob([content], { type });
+    const mobile = /iPhone|iPad|iPod|Android/i.test(navigator.userAgent) || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
+    if (mobile && navigator.canShare) {
+      try {
+        const file = new File([blob], name, { type });
+        if (navigator.canShare({ files: [file] })) { await navigator.share({ files: [file], title: name }); return; }
+      } catch (e) { if (e && e.name === 'AbortError') return; }
+    }
+    const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
-    a.href = URL.createObjectURL(blob); a.download = name;
+    a.href = url; a.download = name; a.rel = 'noopener';
     document.body.appendChild(a); a.click(); a.remove();
-    setTimeout(() => URL.revokeObjectURL(a.href), 2000);
+    setTimeout(() => URL.revokeObjectURL(url), 4000);
+    toast(`${name} indirildi`);
+  }
+
+  // ---------- Sayfa: Ekstre ----------
+  // Banka ekstresi gibi: o ayın tüm çıkışları (giderler, sabit ödemeler, taksitler, birikime yatırılanlar) tarih sırasıyla
+  function ekstreRows(m, key) {
+    const catById = Object.fromEntries(m.categories.map((c) => [c.id, c]));
+    const rows = m.expenses.map((e) => {
+      const c = catById[e.catId];
+      return { date: e.date, desc: e.desc || (c ? catLabel(c) : 'Gider'), amount: +e.amount || 0 };
+    });
+    const items = (m.saving && m.saving.items) || [];
+    items.filter((i) => i.done).forEach((i) => rows.push({ date: i.doneDate || `${key}-01`, desc: `Birikim — ${itemLabel(i)}`, amount: +i.doneAmount || 0 }));
+    const log = (m.saving && m.saving.log) || [];
+    log.forEach((l) => rows.push({ date: l.date, desc: `Birikim — ${l.label}`, amount: +l.amount || 0 }));
+    // Kayıt tutulmadan önce yapılmış ekstra aktarımlar
+    const known = sum(items.filter((i) => i.done), 'doneAmount') + sum(log, 'amount');
+    const rest = Math.round(((m.saving && m.saving.done) || 0) - known);
+    if (rest > 0) rows.push({ date: `${key}-${pad(daysInMonth(key))}`, desc: 'Birikime aktarım', amount: rest });
+    return rows.sort((a, b) => a.date.localeCompare(b.date));
+  }
+  function renderEkstre() {
+    const key = curMonthKey(), m = getMonth(key);
+    const rows = m ? ekstreRows(m, key) : [];
+    const total = sum(rows, 'amount');
+    view.innerHTML = `
+      <div class="card ekstre">
+        <div class="card-head"><h3>${monthName(key)} ekstresi</h3><span class="muted small">${rows.length} işlem</span></div>
+        ${rows.length ? `<ul class="list">${rows.map((r) => `<li><div class="ek-date">${shortDate(r.date)}</div><div class="main"><div class="title">${esc(r.desc)}</div></div><div class="amt">−${money2(r.amount)}</div></li>`).join('')}</ul>`
+          : '<p class="muted small">Bu ay henüz harcama yok.</p>'}
+        <div class="ek-total"><span>Toplam harcanan</span><b>${money2(total)}</b></div>
+      </div>
+      <button class="btn" id="ek-dl" ${rows.length ? '' : 'disabled'}>⬇︎ Ekstreyi indir</button>`;
+    $('#ek-dl').onclick = () => {
+      const q = (x) => `"${String(x).replace(/"/g, '""')}"`;
+      const tl = (n) => (Math.round(n * 100) / 100).toFixed(2).replace('.', ',');
+      const lines = [
+        [`Finansım — ${monthName(key)} ekstresi`], [`${state.user.name} (@${state.user.handle}#${state.user.tag})`], [],
+        ['Tarih', 'Açıklama', 'Tutar (TL)'],
+        ...rows.map((r) => [r.date.split('-').reverse().join('.'), r.desc, '-' + tl(r.amount)]),
+        [], ['', 'Toplam harcanan', '-' + tl(total)],
+      ];
+      download(`ekstre-${key}.csv`, '﻿' + lines.map((l) => l.map(q).join(';')).join('\r\n'), 'text/csv');
+    };
   }
 
   // ---------- Karşılama ----------
@@ -2451,9 +2535,9 @@
     const r = route();
     const h = new Date().getHours();
     const greet = h < 6 ? 'İyi geceler' : h < 12 ? 'Günaydın' : h < 18 ? 'Merhaba' : 'İyi akşamlar';
-    const titles = { birikim: 'Birikimim', ayarlar: 'Ayarlar', rapor: 'Raporlar', islem: 'Giriş / Çıkış', odemeler: 'Ödemeler' };
+    const titles = { birikim: 'Birikimim', ayarlar: 'Ayarlar', rapor: 'Raporlar', islem: 'Giriş / Çıkış', odemeler: 'Ödemeler', ekstre: 'Ekstre' };
     $('#hello').textContent = titles[r] || `${greet}, ${state.user.name}`;
-    $('#month-switch').hidden = !(r === 'ozet' || r === 'islem' || r === 'odemeler');
+    $('#month-switch').hidden = !(r === 'ozet' || r === 'islem' || r === 'odemeler' || r === 'ekstre');
     $('#m-label').textContent = monthName(curMonthKey());
     $$('#tabbar a').forEach((a) => a.classList.toggle('active', a.dataset.tab === r));
     $('#fab').hidden = !(r === 'ozet' || r === 'birikim');
@@ -2462,7 +2546,7 @@
   function renderView() {
     hideTip();
     updateHeader();
-    ({ ozet: renderOzet, islem: renderIslem, odemeler: renderOdemeler, rapor: renderRapor, birikim: renderBirikim, ayarlar: renderAyarlar }[route()] || renderOzet)();
+    ({ ozet: renderOzet, islem: renderIslem, odemeler: renderOdemeler, ekstre: renderEkstre, rapor: renderRapor, birikim: renderBirikim, ayarlar: renderAyarlar }[route()] || renderOzet)();
   }
   function render() {
     applyTheme();

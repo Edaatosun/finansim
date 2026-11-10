@@ -1,5 +1,5 @@
 // Uygulama kabuğunu önbelleğe alır (yalnızca HTTPS veya localhost'ta çalışır).
-const CACHE = 'finansim-v6';
+const CACHE = 'finansim-v7';
 const SHELL = ['./', 'index.html', 'css/app.css', 'js/app.js', 'manifest.webmanifest', 'icons/icon.svg', 'icons/icon-180.png'];
 self.addEventListener('install', (e) => { e.waitUntil(caches.open(CACHE).then((c) => c.addAll(SHELL))); self.skipWaiting(); });
 self.addEventListener('activate', (e) => { e.waitUntil(caches.keys().then((ks) => Promise.all(ks.filter((k) => k !== CACHE).map((k) => caches.delete(k))))); self.clients.claim(); });

@@ -112,7 +112,7 @@ a { color: var(--accent); }
 /* Tab bar */
 .tabbar {
   position: fixed; left: 0; right: 0; bottom: 0; z-index: 30;
-  display: grid; grid-template-columns: repeat(5, 1fr);
+  display: grid; grid-template-columns: repeat(6, 1fr);
   height: calc(var(--tabbar-h) + var(--safe-b)); padding-bottom: var(--safe-b);
   background: color-mix(in srgb, var(--surface) 92%, transparent);
   backdrop-filter: saturate(1.6) blur(14px);
@@ -412,3 +412,17 @@ textarea.input { resize: vertical; font-size: 15px; }
 .choice { display: flex; gap: 12px; align-items: center; width: 100%; text-align: left; border: 1.5px solid var(--line); background: var(--surface); border-radius: 14px; padding: 14px; margin-top: 10px; }
 .choice:active { border-color: var(--accent); background: var(--accent-soft); }
 .choice .ic { font-size: 26px; flex: none; }
+
+/* v6 — kategori dökümü, ekstre, 6 sekme */
+.tabbar a { font-size: 10.5px; letter-spacing: -.01em; }
+.tabbar svg { width: 23px; height: 23px; }
+.caret { color: var(--text-3); font-size: 12px; margin-left: 2px; }
+.cat-detail { background: var(--surface-2); border-radius: 12px; padding: 6px 12px 12px; margin-top: 10px; }
+.cat-detail .list li { padding: 9px 0; }
+.cat-detail .list li + li { border-top-color: var(--line); }
+.cd-title { font-size: 12px; font-weight: 700; color: var(--text-3); text-transform: uppercase; letter-spacing: .04em; margin: 10px 0 2px; }
+.ekstre .list li { gap: 12px; }
+.ek-date { flex: none; width: 52px; font-size: 12.5px; color: var(--text-3); font-variant-numeric: tabular-nums; }
+.ek-total { display: flex; justify-content: space-between; align-items: baseline; border-top: 2px solid var(--text); margin-top: 6px; padding-top: 12px; font-size: 16px; }
+.ek-total b { font-size: 20px; }
+.btn:disabled { opacity: .45; }
