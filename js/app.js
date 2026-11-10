@@ -904,7 +904,6 @@
         </ul>
         ${s.unalloc < 0 ? `<div class="warnbox">⚠︎ Kategorilere koyduğun limitlerin toplamı (${money(s.allocated)}), harcamalara kalan paradan (${money(s.kalan)}) <b>${money(-s.unalloc)} fazla</b>. Bütün limitleri sonuna kadar kullanırsan paran yetmez. Bazı limitleri düşür ya da birikimi azalt. <a href="#" id="fix-plan">Planı düzenle</a></div>` : ''}
         ${!m.detached && monthKeys().some((k) => k > key) ? `<button class="link-btn small" id="carry" style="margin-top:8px">↪ Bu ayın son halini sonraki aylara aktar</button>` : ''}
-        ${key > monthKeyOf() && !m.expenses.length && !(m.saving && m.saving.done) ? `<div class="warnbox" style="background:var(--surface-2)">${monthName(key)} ileride bir ay ve henüz içine bir şey girilmedi. Yanlışlıkla açtıysan geri alabilirsin; ay o zaman açılmamış haline döner. <button class="link-btn" id="unbuild">↩ ${monthName(key)} planını geri al</button></div>` : ''}
       </div>
 
       <div class="card">
@@ -983,11 +982,6 @@
     const rv = $('#review'); if (rv) rv.onclick = () => openWizard('edit');
     $('#edit-plan').onclick = () => openWizard(state.plan ? 'edit' : 'first');
     const fp = $('#fix-plan'); if (fp) fp.onclick = (ev) => { ev.preventDefault(); openWizard('edit', 3); };
-    const ub = $('#unbuild'); if (ub) ub.onclick = () => {
-      if (!confirm(`${monthName(key)} için uygulanan plan geri alınsın mı? Ay açılmamış haline döner; istediğin zaman tekrar uygulayabilirsin.`)) return;
-      delete state.months[key];
-      save(); toast(`${monthName(key)} planı geri alındı`); renderView();
-    };
     const cr = $('#carry'); if (cr) cr.onclick = () => {
       if (!confirm(`${monthName(key)} ayının limitleri, kategorileri ve sabit giderleri sonraki aylara da uygulansın mı? (Harcamalar korunur)`)) return;
       promoteToPlan(m);
