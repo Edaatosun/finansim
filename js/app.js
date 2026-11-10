@@ -902,9 +902,7 @@
           <li class="sub minus"><span class="k">Kategorilere ayrılan</span><span class="v">${money(s.allocated)}</span></li>
           <li class="sub"><span class="k">${s.unalloc < 0 ? '<span class="bad">Limitler kalanı aşıyor</span>' : 'Boşta kalan (hiçbir kategoriye ayrılmamış)'}</span><span class="v ${s.unalloc < 0 ? 'bad' : 'good'}">${money(Math.abs(s.unalloc))}</span></li>
         </ul>
-        ${s.unalloc < 0 ? `<div class="warnbox">⚠︎ Kategorilere koyduğun limitlerin toplamı (${money(s.allocated)}), harcamalara kalan paradan (${money(s.kalan)}) <b>${money(-s.unalloc)} fazla</b>. Bütün limitleri sonuna kadar kullanırsan paran yetmez. Bazı limitleri düşür ya da birikimi azalt. <a href="#" id="fix-plan">Planı düzenle</a></div>` : ''}
-        ${!m.detached && monthKeys().some((k) => k > key) ? `<button class="link-btn small" id="carry" style="margin-top:8px">↪ Bu ayın son halini sonraki aylara aktar</button>` : ''}
-      </div>
+        ${s.unalloc < 0 ? `<div class="warnbox">⚠︎ Kategorilere koyduğun limitlerin toplamı (${money(s.allocated)}), harcamalara kalan paradan (${money(s.kalan)}) <b>${money(-s.unalloc)} fazla</b>. Bütün limitleri sonuna kadar kullanırsan paran yetmez. Bazı limitleri düşür ya da birikimi azalt. <a href="#" id="fix-plan">Planı düzenle</a></div>` : ''}      </div>
 
       <div class="card">
         <div class="card-head"><h3>💰 Gelirlerim</h3><button class="btn small" id="add-inc">+ Gelir</button></div>
@@ -982,12 +980,6 @@
     const rv = $('#review'); if (rv) rv.onclick = () => openWizard('edit');
     $('#edit-plan').onclick = () => openWizard(state.plan ? 'edit' : 'first');
     const fp = $('#fix-plan'); if (fp) fp.onclick = (ev) => { ev.preventDefault(); openWizard('edit', 3); };
-    const cr = $('#carry'); if (cr) cr.onclick = () => {
-      if (!confirm(`${monthName(key)} ayının limitleri, kategorileri ve sabit giderleri sonraki aylara da uygulansın mı? (Harcamalar korunur)`)) return;
-      promoteToPlan(m);
-      monthKeys().filter((k) => k > key).forEach((k) => syncMonth(k, null));
-      save(); toast('Sonraki aylar bu ayın haline getirildi');
-    };
     $('#add-inc').onclick = () => incomeForm(m);
     $$('[data-inc]', view).forEach((li) => (li.onclick = () => incomeForm(m, m.incomes.find((i) => i.id === li.dataset.inc))));
     $('#add-cat').onclick = () => categoryForm(m, null);
