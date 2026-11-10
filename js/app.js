@@ -875,8 +875,9 @@
           <li class="minus"><span class="k">− Planlanan birikim</span><span class="v">${money(s.savingPlanned)}</span></li>
           <li class="total"><span class="k">= Kalan</span><span class="v ${s.kalan < 0 ? 'bad' : ''}">${money(s.kalan)}</span></li>
           <li class="sub minus"><span class="k">Kategorilere ayrılan</span><span class="v">${money(s.allocated)}</span></li>
-          <li class="sub"><span class="k">${s.unalloc < 0 ? '<span class="bad">Fazla dağıtılan</span>' : 'Dağıtılmamış (serbest)'}</span><span class="v ${s.unalloc < 0 ? 'bad' : 'good'}">${money(Math.abs(s.unalloc))}</span></li>
+          <li class="sub"><span class="k">${s.unalloc < 0 ? '<span class="bad">Limitler kalanı aşıyor</span>' : 'Boşta kalan (hiçbir kategoriye ayrılmamış)'}</span><span class="v ${s.unalloc < 0 ? 'bad' : 'good'}">${money(Math.abs(s.unalloc))}</span></li>
         </ul>
+        ${s.unalloc < 0 ? `<div class="warnbox">⚠︎ Kategorilere koyduğun limitlerin toplamı (${money(s.allocated)}), harcamalara kalan paradan (${money(s.kalan)}) <b>${money(-s.unalloc)} fazla</b>. Bütün limitleri sonuna kadar kullanırsan paran yetmez. Bazı limitleri düşür ya da birikimi azalt. <a href="#" id="fix-plan">Planı düzenle</a></div>` : ''}
       </div>
 
       <div class="card">
@@ -953,6 +954,7 @@
 
     const rv = $('#review'); if (rv) rv.onclick = () => openWizard('edit');
     $('#edit-plan').onclick = () => openWizard(state.plan ? 'edit' : 'first');
+    const fp = $('#fix-plan'); if (fp) fp.onclick = (ev) => { ev.preventDefault(); openWizard('edit', 3); };
     $('#add-inc').onclick = () => incomeForm(m);
     $$('[data-inc]', view).forEach((li) => (li.onclick = () => incomeForm(m, m.incomes.find((i) => i.id === li.dataset.inc))));
     $('#add-cat').onclick = () => categoryForm(m, null);
@@ -1859,7 +1861,7 @@
           <div class="subsum" id="ss-${c.id}">${subSumText(c)}</div>
           <label class="check slim"><input type="checkbox" data-f="cat-sav" data-id="${c.id}" ${c.toSavings ? 'checked' : ''}> Ay sonunda artarsa birikime aktar</label>
         </div>`).join('') || '<p class="muted small">Henüz kategori seçmedin.</p>'}
-        <div class="wbox" style="margin-top:12px">Dağıtılmamış (serbest cep)<div class="big" id="w-a">${money(t.unalloc)}</div><span class="small muted">Ay sonunda harcanmazsa birikime aktarabilirsin.</span></div>
+        <div class="wbox" style="margin-top:12px"><span id="w-al">${t.unalloc < 0 ? 'Limitler kalanı aşıyor' : 'Boşta kalan (hiçbir kategoriye ayrılmamış)'}</span><div class="big" id="w-a">${money(t.unalloc)}</div><span class="small muted" id="w-ah">${t.unalloc < 0 ? 'Limitlerin toplamı harcamalarına kalan paradan fazla; bazılarını düşür.' : 'Ay sonunda harcanmazsa birikime aktarabilirsin.'}</span></div>
         <button type="button" class="btn secondary" data-act="suggest">✨ Önerilen dağılımı uygula</button>
         <details style="margin-top:10px"><summary class="small muted">Önerilen dağılım nasıl hesaplanıyor?</summary>
           <p class="small muted">Kalanın %95'i kategorilerin önemine göre bölünür, %5'i (${money(Math.max(0, t.kalan) * 0.05)}) beklenmedik giderler için serbest kalır. Alt başlıklar kategori bütçesinin içinden bölünür.</p>
@@ -1875,9 +1877,9 @@
           <li class="total"><span class="k">= Harcamalarına kalan</span><span class="v ${t.kalan < 0 ? 'bad' : ''}">${money(t.kalan)}</span></li>
           ${p.categories.map((c) => `<li class="sub"><span class="k">${esc(c.emoji || '')} ${esc(c.name)}</span><span class="v">${money(c.planned)}</span></li>
             ${(c.subs || []).map((s) => `<li class="sub" style="padding-left:18px"><span class="k muted">└ ${esc(s.name)}</span><span class="v muted">${money(s.planned)}</span></li>`).join('')}`).join('')}
-          <li class="sub"><span class="k">Dağıtılmamış</span><span class="v ${t.unalloc < 0 ? 'bad' : 'good'}">${money(t.unalloc)}</span></li>
+          <li class="sub"><span class="k">${t.unalloc < 0 ? "Limitler kalanı aşıyor" : "Boşta kalan"}</span><span class="v ${t.unalloc < 0 ? "bad" : "good"}">${money(Math.abs(t.unalloc))}</span></li>
         </ul>
-        ${t.unalloc < 0 ? `<p class="small bad">⚠︎ Kategorilere kalandan ${money(-t.unalloc)} fazla dağıttın.</p>` : ''}
+        ${t.unalloc < 0 ? `<p class="small bad">⚠︎ Kategori limitlerinin toplamı (${money(t.alloc)}) harcamalarına kalan paradan (${money(t.kalan)}) ${money(-t.unalloc)} fazla. Bütün limitleri kullanırsan paran yetmez; bazılarını düşür.</p>` : ''}
         ${bad.map((c) => `<p class="small bad">⚠︎ ${esc(c.name)}: alt bütçeler limiti aşıyor.</p>`).join('')}
         <label class="check" style="margin-top:12px"><input type="checkbox" id="w-apply" ${w.apply ? 'checked' : ''}> Bu aya da uygula (${monthName(now)}) — harcamaların korunur</label>
         <p class="hint">Plan her yeni ayda otomatik kullanılır. Değiştirmediğin sürece aynı planla devam edersin; değiştirirsen yeni planla ilerlersin. Ayarlar → Planım.</p>`;
@@ -1900,7 +1902,12 @@
       if (b) b.textContent = money(t.afterFixed);
       const b2 = $('#w-b2', root); if (b2) b2.textContent = money(t.saving);
       if (w.step === 2) p.savingItems.forEach((i) => { const e = $(`#est-${i.id}`, root); if (e) e.textContent = money(estItem(i)); });
-      if (w.step === 3) p.categories.forEach((c) => { const e = $(`#ss-${c.id}`, root); if (e) e.innerHTML = subSumText(c); });
+      if (w.step === 3) {
+        p.categories.forEach((c) => { const e = $(`#ss-${c.id}`, root); if (e) e.innerHTML = subSumText(c); });
+        const al = $('#w-al', root), ah = $('#w-ah', root);
+        if (al) al.textContent = t.unalloc < 0 ? 'Limitler kalanı aşıyor' : 'Boşta kalan (hiçbir kategoriye ayrılmamış)';
+        if (ah) ah.textContent = t.unalloc < 0 ? 'Limitlerin toplamı harcamalarına kalan paradan fazla; bazılarını düşür.' : 'Ay sonunda harcanmazsa birikime aktarabilirsin.';
+      }
     };
     $$('[data-f]', root).forEach((el) => {
       if (el.dataset.f === 'si-type') { el.onchange = () => { const i = find(p.savingItems, el.dataset.id); i.type = el.value; if (i.type !== 'TRY') i.qty = i.qty || 1; drawWizard(w); }; return; }
