@@ -2708,14 +2708,29 @@
     };
   }
 
+  // Yeni aya girilince ay kendiliğinden açılmaz; "Planımı uygula / Bu ay boş başlasın" seçimi gösterilir.
   function autoRollover() {
     const now = monthKeyOf();
     if (!state || state.months[now]) return;
-    if (!state.plan && !monthKeys().length) return;
-    ensureMonth(now);
     state.ui.month = now;
     save();
-    setTimeout(() => toast(`${monthName(now)} planından oluşturuldu`), 600);
+  }
+
+  // Seçili ayın planını ve o aya ait tüm kayıtları kaldırır; ay hiç açılmamış gibi olur.
+  function removeMonthPlan() {
+    const key = curMonthKey(), m = getMonth(key);
+    if (!m) { toast(`${monthName(key)} için uygulanmış bir plan yok`); return; }
+    const nEx = m.expenses.length, nInc = m.incomes.length;
+    const items = (m.saving && m.saving.items) || [];
+    if (!confirm(`${monthName(key)} planını kaldırmak istediğine emin misin?`)) return;
+    if (!confirm(`Dikkat: ${monthName(key)} ayına ait tüm girdiler ve çıktılar silinecek (${nEx} gider, ${nInc} gelir${items.some((i) => i.done) ? ', bu ay “Aldım” dediğin birikimler' : ''}). Bu ayın tüm verileri gidecek ve geri alınamaz. Emin misin?`)) return;
+    // Bu ayın "Aldım" ile eklenen birikimlerini de birikimden çıkar
+    const hIds = new Set(items.map((i) => i.holdingId).filter(Boolean));
+    state.savings.holdings = state.savings.holdings.filter((h) => !hIds.has(h.id));
+    delete state.months[key];
+    openCats.clear(); state.ui.cat = null;
+    save(); toast(`${monthName(key)} planı kaldırıldı`);
+    location.hash = '#/ozet'; renderView();
   }
 
   // ---------- Yönlendirme ----------
@@ -2739,8 +2754,11 @@
       ['rapor', '📊', 'Rapor', 'Aylık başarı ve kategori karnesi'],
       ['ayarlar', '⚙️', 'Ayarlar', 'Planım, hesabım, yedek, tema'],
     ];
-    openSheet('Menü', `<div class="menu-grid">${items.map(([k, ic, n, d]) => `<button class="menu-item ${route() === k ? 'on' : ''}" data-go-page="${k}"><span class="ic">${ic}</span><span><b>${n}</b><br><span class="muted small">${d}</span></span></button>`).join('')}</div>`, (root) => {
+    const hasMonth = !!getMonth(curMonthKey());
+    openSheet('Menü', `<div class="menu-grid">${items.map(([k, ic, n, d]) => `<button class="menu-item ${route() === k ? 'on' : ''}" data-go-page="${k}"><span class="ic">${ic}</span><span><b>${n}</b><br><span class="muted small">${d}</span></span></button>`).join('')}
+      ${hasMonth ? `<button class="menu-item danger-item" id="rm-month"><span class="ic">🗑</span><span><b>${monthName(curMonthKey())} planını kaldır</b><br><span class="muted small">Sadece bu ay; tüm girdi ve çıktıları silinir, yeniden plan seçersin</span></span></button>` : ''}</div>`, (root) => {
       $$('[data-go-page]', root).forEach((b) => (b.onclick = () => { closeSheet(); location.hash = '#/' + b.dataset.goPage; }));
+      const rm = $('#rm-month', root); if (rm) rm.onclick = () => { closeSheet(); removeMonthPlan(); };
     });
   }
   function renderView() {
